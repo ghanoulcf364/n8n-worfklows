@@ -1,0 +1,1234 @@
+{
+  "name": "Full System",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {}
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -640,
+        1824
+      ],
+      "id": "55ca8d9d-346b-4515-9113-56d5db1215e8",
+      "name": "Daily Schedule"
+    },
+    {
+      "parameters": {
+        "jsCode": "// I import fetch for API requests\nconst fetch = require('node-fetch');\n\n// ----------------Configuration----------------\nconst GHL_ACCESS_TOKEN = 'pit-94f29fed-e00e-4ad2-8ddb-0d4e2b7a1cf0';\nconst API_BASE_URL = 'https://services.leadconnectorhq.com';\nconst LOCATION_ID = 'dONNCZt2WqGTCfexlC7S'; // Mandatory for search\n\n// I set the start of today (00:00:00) to filter conversations\nconst todayStart = new Date();\ntodayStart.setHours(0, 0, 0, 0);\n\ntry {\n  let validConversations = [];\n  let stopFetching = false;\n  let cursor = null; // For pagination (startAfterDate)\n\n  // I loop to fetch pages until I hit old dates or finish\n  while (!stopFetching) {\n    // Construct URL with query parameters\n    let url = `${API_BASE_URL}/conversations/search?locationId=${LOCATION_ID}&sort=desc&sortBy=last_message_date&limit=100&lastMessageType=TYPE_WHATSAPP`;\n    \n    if (cursor) {\n      url += `&startAfterDate=${cursor}`;\n    }\n\n    const response = await fetch(url, {\n      method: 'GET',\n      headers: {\n        'Authorization': `Bearer ${GHL_ACCESS_TOKEN}`,\n        'Version': '2021-04-15',\n        'Accept': 'application/json'\n      }\n    });\n\n    if (!response.ok) throw new Error(`API Error: ${response.statusText}`);\n    \n    const data = await response.json();\n    const conversations = data.conversations || [];\n\n    if (conversations.length === 0) break; // No more data\n\n    // I iterate through the fetched batch to check dates\n    for (const conv of conversations) {\n      // Use lastMessageDate or dateAdded as fallback\n      const convDate = new Date(conv.lastMessageDate || conv.dateAdded);\n\n      if (convDate >= todayStart) {\n        // It's from today, keep it\n        validConversations.push({\n          json: {\n            id: conv.id,\n            contactId: conv.contactId,\n            fullName: conv.fullName,\n            lastDate: convDate\n          }\n        });\n      } else {\n        // We reached yesterday's data. Since it's sorted DESC, we stop everything.\n        stopFetching = true;\n        break; \n      }\n    }\n\n    // Update cursor for next page (if we are continuing)\n    if (!stopFetching && conversations.length > 0) {\n      // GHL search uses the sort value of the last item for pagination\n      cursor = conversations[conversations.length - 1].lastMessageDate;\n    }\n  }\n\n  console.log(`Found ${validConversations.length} conversations for today.`);\n  \n  // Return the filtered list to the next node\n  return validConversations;\n\n} catch (error) {\n  console.error(error);\n  throw error;\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        1824
+      ],
+      "id": "6c58df30-999e-4a54-99d5-2a71a18e70a5",
+      "name": "GHL: Get Conversations"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fetch = require('node-fetch');\n\n// ----------------Configuration----------------\nconst GHL_ACCESS_TOKEN = 'pit-94f29fed-e00e-4ad2-8ddb-0d4e2b7a1cf0';\nconst API_BASE_URL = 'https://services.leadconnectorhq.com';\nconst BATCH_SIZE = 100; \n\n// I define the list of Conversation IDs to ignore (e.g., Team groups, Internal chats)\nconst IGNORED_CONVERSATION_IDS = [\n  'vKVjGbNht0t7csjwtBhF', \n  '4Tr6HmtaFEP8YtqKOwah'\n];\n\n// Team & AI IDs for classification\nconst TEAM_USER_IDS = [\n  'f0WIjoQupAe6m8CwYxqT', // AsemR\n  'cD2cRozfGaY1dMBVPrQW', // Ahemd\n  'ocpyLNdF0OVgDBFe9Ztd', // Mohammed \n  'pnIGhDkQCYHg469w8Ut6'  // Ghanou\n];\nconst AI_AGENT_USER_ID = '5A7qBK1fknuDuOyznzfA';\n\n// I get all input items from the previous node (Search Node)\nconst inputs = $input.all();\n\n// Helper function: Fetch full history for ONE conversation\nasync function fetchFullHistory(conversationId, contactId) {\n  let allMessages = [];\n  let hasMorePages = true;\n  let lastMessageId = null;\n\n  try {\n    while (hasMorePages) {\n      let url = `${API_BASE_URL}/conversations/${conversationId}/messages?limit=100`;\n      if (lastMessageId) url += `&lastMessageId=${lastMessageId}`;\n\n      const res = await fetch(url, {\n        headers: { \n          'Authorization': `Bearer ${GHL_ACCESS_TOKEN}`, \n          'Version': '2021-04-15' \n        }\n      });\n      \n      if (!res.ok) throw new Error('Msg API Fail');\n      const data = await res.json();\n      const msgs = data.messages?.messages || [];\n\n      if (msgs.length > 0) allMessages = allMessages.concat(msgs);\n\n      hasMorePages = data.messages?.nextPage === true;\n      lastMessageId = data.messages?.lastMessageId;\n      \n      if (hasMorePages && !lastMessageId) break; \n    }\n\n    // Sort messages chronologically\n    allMessages.sort((a, b) => new Date(a.dateAdded) - new Date(b.dateAdded));\n\n    // Format to Markdown\n    let markdown = \"\";\n    let lastDirection = \"\";\n    \n    for (const msg of allMessages) {\n      let sender = \"Unknown\";\n      if (msg.direction === 'inbound') sender = \"User\";\n      else if (msg.direction === 'outbound') {\n        if (msg.userId === AI_AGENT_USER_ID) sender = \"AI Agent\";\n        else if (TEAM_USER_IDS.includes(msg.userId) || !msg.userId) sender = \"Team\";\n      }\n      \n      const body = msg.body || \"[Media]\";\n      const date = new Date(msg.dateAdded).toISOString().split('T')[0];\n      markdown += `[${sender} - ${date}]: ${body}\\n`;\n      lastDirection = msg.direction;\n    }\n\n    // I return the structure including the crucial Contact ID\n    return {\n      conversationId: conversationId,\n      contactId: contactId, // <--- Preserved here\n      history: markdown,\n      messageCount: allMessages.length,\n      lastDirection: lastDirection\n    };\n\n  } catch (e) {\n    return { \n      conversationId: conversationId, \n      contactId: contactId, \n      error: e.message, \n      history: \"Error fetching\" \n    };\n  }\n}\n\n// ----------------Main Execution Logic----------------\nconst processedConversations = [];\nconst CONCURRENCY = 5; \n\n// I filter the inputs first to remove ignored IDs\nconst validInputs = inputs.filter(item => {\n  const id = item.json.id;\n  // If the ID is in the ignored list, I skip it\n  return !IGNORED_CONVERSATION_IDS.includes(id);\n});\n\nconsole.log(`Processing ${validInputs.length} conversations after exclusion.`);\n\nfor (let i = 0; i < validInputs.length; i += CONCURRENCY) {\n  const chunk = validInputs.slice(i, i + CONCURRENCY);\n  \n  // I pass both ID and ContactID to the fetch function\n  const promises = chunk.map(item => fetchFullHistory(item.json.id, item.json.contactId));\n  \n  const results = await Promise.all(promises);\n  processedConversations.push(...results);\n}\n\n// ----------------Batching Logic----------------\nconst batches = {};\nconst numberOfBatches = Math.ceil(processedConversations.length / BATCH_SIZE);\n\nfor (let i = 0; i < numberOfBatches; i++) {\n  const start = i * BATCH_SIZE;\n  const end = start + BATCH_SIZE;\n  batches[`batch_${i + 1}`] = processedConversations.slice(start, end);\n}\n\n// Final Return Structure\nreturn {\n  json: {\n    stats: {\n      originalCount: inputs.length,\n      processedCount: processedConversations.length,\n      numberOfBatches: numberOfBatches,\n      batchSize: BATCH_SIZE\n    },\n    batches: batches\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -192,
+        1824
+      ],
+      "id": "e428b232-65bd-4321-a229-0361b1f56c7c",
+      "name": "GHL: Get Each Conversation + Process"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.stats.numberOfBatches }}",
+                    "rightValue": 1,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    },
+                    "id": "9f704e6b-dfc1-4fec-a259-fd97462fe782"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "100 Convo"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "9a0a80d7-e991-477f-bb4c-5407d6c28d7c",
+                    "leftValue": "={{ $json.stats.numberOfBatches }}",
+                    "rightValue": 2,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "200 Convo"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        32,
+        1824
+      ],
+      "id": "599a479f-d475-4969-9fa4-0a1366ee279b",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "jSfhNZN94aghjbu6",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/jSfhNZN94aghjbu6",
+          "cachedResultName": "Sub-Workflow: 100 Convo"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "batch1": "={{ $json.batches.batch_1 }}"
+          },
+          "matchingColumns": [
+            "batch1"
+          ],
+          "schema": [
+            {
+              "id": "batch1",
+              "displayName": "batch1",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        368,
+        1712
+      ],
+      "id": "2c558d50-e0e2-4739-b27c-388dd28c40fb",
+      "name": "Execute Workflow: 100 Convo"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "tnZAB7YdywrMi8uu",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/tnZAB7YdywrMi8uu",
+          "cachedResultName": "Sub-Workflow: 200 Convo"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "batch1": "={{ $json.batches.batch_1 }}",
+            "batch2": "={{ $json.batches.batch_2 }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "batch1",
+              "displayName": "batch1",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "batch2",
+              "displayName": "batch2",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        256,
+        1904
+      ],
+      "id": "5ca15120-b666-4fb9-b710-e65d0f642913",
+      "name": "Execute Workflow: 200 Convo"
+    },
+    {
+      "parameters": {
+        "fieldsToAggregate": {
+          "fieldToAggregate": [
+            {}
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        480,
+        1904
+      ],
+      "id": "701f5dea-6f2d-42c4-962c-dc40cd290336",
+      "name": "Aggregate"
+    },
+    {
+      "parameters": {
+        "content": "## System",
+        "height": 272,
+        "width": 896
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -704,
+        1744
+      ],
+      "typeVersion": 1,
+      "id": "0bc048ab-9c1d-4763-90af-53d7714e139e",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## AI Process",
+        "height": 432,
+        "width": 464,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        192,
+        1664
+      ],
+      "typeVersion": 1,
+      "id": "e26a5dd7-ecba-41e4-be42-c050f12e7d4f",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "## Actions",
+        "height": 272,
+        "width": 688,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        656,
+        1744
+      ],
+      "typeVersion": 1,
+      "id": "8691695f-3328-45fb-9ff8-97cee5490214",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fetch = require('node-fetch');\n\n// --------------------------------------------------------\n// 1. إعدادات الربط والثوابت (Configuration)\n// --------------------------------------------------------\nconst AIRTABLE_API_KEY = 'patLu1tsO6OQv0sVe.9aa309808fc593eb51de73af9ea463a21c04b69566b8df75f49a06503ef6ba53'; \nconst AIRTABLE_BASE_ID = 'appW9hLpui1gEztZF'; \n\nconst TBL_COURSES = 'tbl39nQC6JONrHWe1';    \nconst TBL_INTERESTS = 'tbljj0lrbnXHNMjoR';  \n\nconst TYPE_FINANCE_ID = 'recrO4GO9ci1NdunR';   \nconst TYPE_INVESTMENT_ID = 'rec6FZInmRfNoSRRq'; \n\nconst TOPIC_MAP = {\n  'Personal Financial Management': TYPE_FINANCE_ID,\n  'Special Financial Consultation': TYPE_FINANCE_ID, // افتراض: الاستشارة تتبع المالية (أو عدلها حسب رغبتك)\n  'Investment and Wealth Management': TYPE_INVESTMENT_ID\n};\n\n// --------------------------------------------------------\n// 2. تجهيز البيانات (Pre-processing) *جديد*\n// --------------------------------------------------------\n// هنا نعالج مشكلة اختلاف هيكلة البيانات\nlet aiResults = [];\nconst inputData = $input.first().json;\n\n// نتأكد هل البيانات جاية داخل records (زي بياناتك الحالية)\nif (inputData.records && Array.isArray(inputData.records)) {\n  // نمشي على كل سجل ونستخرج البيانات ونرتبها\n  aiResults = inputData.records.map(record => {\n    const fields = record.fields || {};\n    \n    // 1. استخراج الـ ID\n    const cId = fields.ContactId; // انتبه للحروف الكبيرة\n\n    // 2. معالجة الاهتمامات (تحويل النص إلى مصفوفة)\n    let interestsArray = [];\n    if (fields.Interests && typeof fields.Interests === 'string') {\n      try {\n        interestsArray = JSON.parse(fields.Interests);\n      } catch (e) {\n        console.log(`Error parsing interests for contact ${cId}:`, e.message);\n      }\n    }\n\n    // نرجع الهيكل اللي الكود الأصلي متعود عليه\n    return {\n      contactId: cId,\n      classification: {\n        interests: interestsArray\n      }\n    };\n  });\n} else {\n  // لو البيانات جاية بالشكل القديم (مباشرة)\n  aiResults = $input.all().map(item => item.json);\n}\n\n// حماية: إذا لا توجد بيانات بعد المعالجة\nif (!aiResults || aiResults.length === 0) {\n  return { json: { result: \"No valid input data found\" } };\n}\n\n// --------------------------------------------------------\n// 3. دوال مساعدة (Helper Functions)\n// --------------------------------------------------------\n\nasync function fetchAllRecords(tableId, params = {}) {\n  let allRecords = [];\n  let offset = null;\n  \n  do {\n    let url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}?`;\n    \n    if (params.sort) url += `&sort[0][field]=${params.sort.field}&sort[0][direction]=${params.sort.direction}`;\n    if (params.fields) params.fields.forEach(f => url += `&fields[]=${f}`);\n    if (params.filterByFormula) url += `&filterByFormula=${encodeURIComponent(params.filterByFormula)}`;\n    if (offset) url += `&offset=${offset}`;\n\n    const response = await fetch(url, {\n      headers: { 'Authorization': `Bearer ${AIRTABLE_API_KEY}` }\n    });\n    \n    if (!response.ok) throw new Error(`Airtable Error (${tableId}): ${response.statusText}`);\n    \n    const data = await response.json();\n    allRecords = allRecords.concat(data.records);\n    offset = data.offset; \n    \n  } while (offset);\n\n  return allRecords;\n}\n\nasync function performBatchOp(tableId, method, records) {\n  const CHUNK_SIZE = 10; \n  const results = [];\n\n  for (let i = 0; i < records.length; i += CHUNK_SIZE) {\n    const chunk = records.slice(i, i + CHUNK_SIZE);\n    \n    const response = await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}`, {\n      method: method, \n      headers: {\n        'Authorization': `Bearer ${AIRTABLE_API_KEY}`,\n        'Content-Type': 'application/json'\n      },\n      body: JSON.stringify({ records: chunk, typecast: true })\n    });\n\n    if (!response.ok) {\n      const err = await response.text();\n      console.error(`Batch Op Failed: ${err}`);\n      continue; \n    }\n    \n    const data = await response.json();\n    results.push(...data.records);\n  }\n  return results;\n}\n\n// --------------------------------------------------------\n// 4. المنطق الرئيسي (Core Logic)\n// --------------------------------------------------------\n\n// الخطوة أ: جلب الدورات وتحديد \"الأحدث\"\nconst rawCourses = await fetchAllRecords(TBL_COURSES, {\n  sort: { field: 'Date', direction: 'desc' }, \n  fields: ['Course Type', 'Status', 'Date']\n});\n\nconst latestInstances = {\n  [TYPE_FINANCE_ID]: null,\n  [TYPE_INVESTMENT_ID]: null\n};\n\nconst instanceTypeMap = {}; \n\nfor (const record of rawCourses) {\n  const courseTypeId = record.fields['Course Type']?.[0]; \n  const id = record.id;\n  const status = record.fields['Status'];\n\n  if (courseTypeId) instanceTypeMap[id] = courseTypeId;\n\n  if (courseTypeId && !latestInstances[courseTypeId]) {\n    latestInstances[courseTypeId] = { id: id, status: status };\n  }\n\n  if (latestInstances[TYPE_FINANCE_ID] && latestInstances[TYPE_INVESTMENT_ID]) break;\n}\n\n// الخطوة ب: جلب اهتمامات العملاء الحالية\nconst contactIds = aiResults.map(r => r.contactId).filter(id => id);\n\nlet contactInterestsMap = {};\n\n// نجلب البيانات فقط إذا فيه عملاء\nif (contactIds.length > 0) {\n    const formula = `OR(${contactIds.map(id => `SEARCH('${id}', ARRAYJOIN({Contact}))`).join(',')})`;\n    \n    const rawInterests = await fetchAllRecords(TBL_INTERESTS, {\n      fields: ['Contact', 'Source Instance', 'Reason'],\n      filterByFormula: formula\n    });\n\n    for (const record of rawInterests) {\n      const cId = record.fields['Contact']?.[0]; \n      const instanceId = record.fields['Source Instance']?.[0];\n      \n      if (cId && instanceId) {\n        if (!contactInterestsMap[cId]) contactInterestsMap[cId] = [];\n        \n        const type = instanceTypeMap[instanceId];\n        \n        contactInterestsMap[cId].push({\n          recordId: record.id,\n          instanceId: instanceId,\n          type: type \n        });\n      }\n    }\n}\n\n// الخطوة ج: غرفة العمليات\nconst toCreate = [];\nconst toUpdate = [];\n\nfor (const customer of aiResults) {\n  const cId = customer.contactId;\n  \n  // الآن نستخدم الحماية ? لكن البيانات يفترض تكون نظيفة من مرحلة التجهيز\n  const interests = customer.classification?.interests || [];\n\n  for (const interest of interests) {\n    \n    const topicType = TOPIC_MAP[interest.topic]; \n    if (!topicType) continue; \n\n    const targetInstance = latestInstances[topicType];\n    if (!targetInstance) continue; \n\n    let reason = \"Didn't Signup\"; \n    if (interest.time === 'new') {\n      if (targetInstance.status !== 'Enrollment Open') {\n        reason = 'Not Open';\n      }\n    }\n\n    const existingRecords = contactInterestsMap[cId] || [];\n    const existingRecord = existingRecords.find(r => r.type === topicType);\n\n    if (interest.time === 'new') {\n      // --- حالة NEW ---\n      if (existingRecord) {\n        if (existingRecord.instanceId !== targetInstance.id) {\n          toUpdate.push({\n            id: existingRecord.recordId,\n            fields: {\n              'Source Instance': [targetInstance.id], \n              'Reason': reason\n            }\n          });\n        }\n      } else {\n        toCreate.push({\n          fields: {\n            'Contact': [cId],\n            'Source Instance': [targetInstance.id],\n            'Reason': reason\n          }\n        });\n      }\n\n    } else if (interest.time === 'old') {\n      // --- حالة OLD ---\n      if (!existingRecord) {\n        toCreate.push({\n          fields: {\n            'Contact': [cId],\n            'Source Instance': [targetInstance.id], \n            'Reason': \"Didn't Signup\"\n          }\n        });\n      }\n    }\n  }\n}\n\n// الخطوة د: التنفيذ\nlet createdCount = 0;\nlet updatedCount = 0;\n\nif (toCreate.length > 0) {\n  const res = await performBatchOp(TBL_INTERESTS, 'POST', toCreate);\n  createdCount = res.length;\n}\n\nif (toUpdate.length > 0) {\n  const res = await performBatchOp(TBL_INTERESTS, 'PATCH', toUpdate);\n  updatedCount = res.length;\n}\n\n// -----------------------------------------------------\n// 5. التقرير النهائي\n// -----------------------------------------------------\nreturn {\n  json: {\n    status: \"success\",\n    summary: {\n      total_processed_customers: aiResults.length,\n      records_created: createdCount,\n      records_updated: updatedCount\n    },\n    operations_log: {\n      created: toCreate.length,\n      updated: toUpdate.length\n    }\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        704,
+        1824
+      ],
+      "id": "b8192400-5d82-4d6f-90bc-2700df5c28ac",
+      "name": "Interests Actions"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fetch = require('node-fetch');\n\n// --------------------------------------------------------\n// 1. CONFIGURATION\n// --------------------------------------------------------\nconst GHL_ACCESS_TOKEN = 'pit-94f29fed-e00e-4ad2-8ddb-0d4e2b7a1cf0'; \nconst API_BASE_URL = 'https://services.leadconnectorhq.com';\n\nconst TAGS_TO_REMOVE = ['Appointment', 'Companies', 'General'];\n\n// --------------------------------------------------------\n// 2. INPUT DATA (تصحيح استخراج القائمة الكاملة)\n// --------------------------------------------------------\n// التعديل: نأخذ العنصر الأول، ثم ندخل لداخل مصفوفة records\nconst wrapperItem = $('Execute Workflow: 100 Convo').first(); \nconst allRecords = wrapperItem.json.records || []; \n\n// الآن نبني مصفوفة المدخلات من السجلات السبعة\nconst inputs = allRecords.map(record => {\n  const fields = record.fields || {};\n  \n  // حماية: نتأكد أن ContactId موجود\n  if (!fields.ContactId) return null;\n\n  return {\n    contactId: fields.ContactId, // انتبه للحروف الكبيرة\n    classification: {\n      tag: fields.Tags // التاق (ممكن يكون undefined وهذا عادي)\n    }\n  };\n}).filter(item => item !== null); // نحذف أي سجل ما فيه ID\n\n// التحقق من صحة البيانات\nif (!inputs || inputs.length === 0) {\n  return { json: { message: \"No valid contacts found inside 'records' array.\" } };\n}\n\n// --------------------------------------------------------\n// 3. HELPER FUNCTION (نفس السابق تماماً)\n// --------------------------------------------------------\nasync function syncContactTags(contactId, newTag) {\n  const result = { contactId, removed: false, added: null, errors: [] };\n\n  const headers = {\n    'Authorization': `Bearer ${GHL_ACCESS_TOKEN}`,\n    'Version': '2021-07-28',\n    'Content-Type': 'application/json',\n    'Accept': 'application/json'\n  };\n\n  // STEP A: REMOVE OLD TAGS\n  try {\n    const deleteUrl = `${API_BASE_URL}/contacts/${contactId}/tags`;\n    const deleteRes = await fetch(deleteUrl, {\n      method: 'DELETE',\n      headers: headers,\n      body: JSON.stringify({ tags: TAGS_TO_REMOVE })\n    });\n\n    if (deleteRes.ok) {\n      result.removed = true;\n    } else {\n      // const errText = await deleteRes.text();\n      // warning ignored\n    }\n  } catch (err) {\n    result.errors.push(`Delete Network Error: ${err.message}`);\n  }\n\n  // STEP B: ADD NEW TAG\n  if (newTag && newTag !== 'General') {\n    try {\n      const addUrl = `${API_BASE_URL}/contacts/${contactId}/tags`;\n      const addRes = await fetch(addUrl, {\n        method: 'POST',\n        headers: headers,\n        body: JSON.stringify({ tags: [newTag] })\n      });\n\n      if (addRes.ok) {\n        result.added = newTag;\n      } else {\n        const errText = await addRes.text();\n        result.errors.push(`Add Failed: ${errText}`);\n      }\n    } catch (err) {\n      result.errors.push(`Add Network Error: ${err.message}`);\n    }\n  }\n\n  return result;\n}\n\n// --------------------------------------------------------\n// 4. MAIN EXECUTION (نفس السابق)\n// --------------------------------------------------------\nconst finalResults = [];\nconst CONCURRENCY_LIMIT = 5;\n\nfor (let i = 0; i < inputs.length; i += CONCURRENCY_LIMIT) {\n  const chunk = inputs.slice(i, i + CONCURRENCY_LIMIT);\n  \n  const promises = chunk.map(item => {\n    return syncContactTags(item.contactId, item.classification.tag);\n  });\n\n  const chunkResults = await Promise.all(promises);\n  finalResults.push(...chunkResults);\n}\n\nreturn {\n  json: {\n    status: \"success\",\n    processed_count: finalResults.length, // المفروض يطلع 7 الآن\n    details: finalResults\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        1824
+      ],
+      "id": "c049c563-0c56-4c8c-acee-f3d1f4168dab",
+      "name": "Tags Actions"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fetch = require('node-fetch');\n\n// --------------------------------------------------------\n// 1. CONFIGURATION\n// --------------------------------------------------------\nconst GHL_ACCESS_TOKEN = 'pit-94f29fed-e00e-4ad2-8ddb-0d4e2b7a1cf0';\nconst GHL_BASE_URL = 'https://services.leadconnectorhq.com';\nconst WAHA_BASE_URL = 'http://waha.iqdamai.com';\nconst SESSION_NAME = 'default';\n\n// معرفات العلامات في Waha\nconst LABELS = {\n  COMPANIES: \"58\",\n  CONSULTING: \"242\",\n  MARKETING_INVEST: \"237\",\n  MARKETING_SAVINGS: \"243\"\n};\n\n// --------------------------------------------------------\n// 2. INPUT DATA (CRITICAL FIX HERE)\n// --------------------------------------------------------\n// التعديل: استخراج .json من كل عنصر لضمان وصول البيانات بشكل صحيح\nconst inputs = $('Execute Workflow: 100 Convo').all().map(i => i.json);\n\nif (!inputs || inputs.length === 0) {\n  return { json: { message: \"No conversations to process\" } };\n}\n\n// --------------------------------------------------------\n// 3. HELPER FUNCTIONS\n// --------------------------------------------------------\n\n// دالة لجلب رقم الهاتف من GHL\nasync function getContactPhone(contactId) {\n  if (!contactId) return null; // حماية إضافية\n  try {\n    const url = `${GHL_BASE_URL}/contacts/${contactId}`;\n    const res = await fetch(url, {\n      method: 'GET',\n      headers: {\n        'Authorization': `Bearer ${GHL_ACCESS_TOKEN}`,\n        'Version': '2021-07-28',\n        'Accept': 'application/json'\n      }\n    });\n\n    if (!res.ok) return null;\n    \n    const data = await res.json();\n    \n    // التعامل مع رد GHL سواء كان Array أو Object\n    // حسب المثال اللي أرسلته أنت، الرد هو مصفوفة [ { contact: { ... } } ]\n    const contactObj = Array.isArray(data) ? data[0]?.contact : (data.contact || data);\n    \n    return contactObj?.phone || null;\n  } catch (e) {\n    return null;\n  }\n}\n\n// دالة لجلب العلامات الحالية من Waha\nasync function getWahaLabels(chatId) {\n  try {\n    const url = `${WAHA_BASE_URL}/api/${SESSION_NAME}/labels/chats/${chatId}`;\n    const res = await fetch(url);\n    if (!res.ok) return [];\n    \n    const data = await res.json();\n    return data.map(l => l.id) || [];\n  } catch (e) {\n    return [];\n  }\n}\n\n// الدالة الرئيسية لمعالجة كل عميل\nasync function processConversation(item) {\n  const result = { \n    contactId: item.contactId, \n    status: 'skipped', \n    reason: null,\n    labels_set: []\n  };\n\n  // أ. جلب رقم الهاتف\n  const rawPhone = await getContactPhone(item.contactId);\n  \n  if (!rawPhone) {\n    result.status = 'failed';\n    result.reason = `Phone not found for ContactID: ${item.contactId}`;\n    return result;\n  }\n\n  // ب. تحويل الرقم لصيغة Waha\n  const cleanPhone = rawPhone.replace(/\\D/g, ''); \n  const wahaChatId = `${cleanPhone}@c.us`;\n\n  // ج. تحديد العلامات الجديدة من الـ AI\n  const aiLabels = [];\n  const classification = item.classification;\n\n  if (classification.tag === 'Companies') aiLabels.push(LABELS.COMPANIES);\n  if (classification.tag === 'Appointment') aiLabels.push(LABELS.CONSULTING);\n  \n  if (classification.interests) {\n    for (const interest of classification.interests) {\n      if (interest.topic === 'Investment and Wealth Management') aiLabels.push(LABELS.MARKETING_INVEST);\n      if (interest.topic === 'Personal Financial Management') aiLabels.push(LABELS.MARKETING_SAVINGS);\n    }\n  }\n\n  let finalLabels = [...new Set(aiLabels)];\n\n  // د. المنطق الهجين\n  if (classification.tag === 'Companies') {\n    const currentLabels = await getWahaLabels(wahaChatId);\n    finalLabels = [...new Set([...currentLabels, ...finalLabels])];\n    result.logic = 'merge_existing';\n  } else {\n    result.logic = 'overwrite';\n  }\n\n  // هـ. تطبيق التغييرات في Waha\n  try {\n    const url = `${WAHA_BASE_URL}/api/${SESSION_NAME}/labels/chats/${wahaChatId}/`;\n    // Payload Format: { \"labels\": [ {\"id\": \"58\"}, {\"id\": \"237\"} ] }\n    const body = { labels: finalLabels.map(id => ({ id })) };\n\n    const res = await fetch(url, {\n      method: 'PUT',\n      headers: { 'Content-Type': 'application/json', 'X-Api-Key': '9f5e7c47a2d892adf840cb21c227c07e349f2bbec9c5c99b147b0c8c71668a4f' },\n      body: JSON.stringify(body)\n    });\n\n    if (res.ok) {\n      result.status = 'success';\n      result.labels_set = finalLabels;\n      result.wahaChatId = wahaChatId;\n    } else {\n      const err = await res.text();\n      result.status = 'error';\n      result.reason = `Waha API Error: ${err}`;\n    }\n  } catch (e) {\n    result.status = 'error';\n    result.reason = `Network Error: ${e.message}`;\n  }\n\n  return result;\n}\n\n// --------------------------------------------------------\n// 4. EXECUTION LOOP\n// --------------------------------------------------------\nconst finalOutput = [];\nconst CONCURRENCY = 5;\n\nfor (let i = 0; i < inputs.length; i += CONCURRENCY) {\n  const chunk = inputs.slice(i, i + CONCURRENCY);\n  const promises = chunk.map(item => processConversation(item));\n  const chunkResults = await Promise.all(promises);\n  finalOutput.push(...chunkResults);\n}\n\nreturn {\n  json: {\n    summary: {\n      total: inputs.length,\n      success: finalOutput.filter(r => r.status === 'success').length,\n      failed: finalOutput.filter(r => r.status === 'failed').length,\n      error: finalOutput.filter(r => r.status === 'error').length\n    },\n    details: finalOutput\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        1824
+      ],
+      "id": "a6c3f6bb-7b96-442a-98f0-dc54ce57a9d9",
+      "name": "Labels Actions",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "__rl": true,
+          "value": "appW9hLpui1gEztZF",
+          "mode": "list",
+          "cachedResultName": "WB Marketing Campaigns",
+          "cachedResultUrl": "https://airtable.com/appW9hLpui1gEztZF"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblHNrKGKATOdV2np",
+          "mode": "list",
+          "cachedResultName": "Contacts",
+          "cachedResultUrl": "https://airtable.com/appW9hLpui1gEztZF/tblHNrKGKATOdV2np"
+        },
+        "filterByFormula": "=({Contact Id} = '{{ $json.body.id }}')",
+        "returnAll": false,
+        "limit": 1,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        80,
+        1264
+      ],
+      "id": "b7c701d7-aaef-408a-b49e-a29b4eb46255",
+      "name": "Find Contact",
+      "notesInFlow": true,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "NFqjmZwVouJIyAfB",
+          "name": "All"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "__rl": true,
+          "value": "appW9hLpui1gEztZF",
+          "mode": "list",
+          "cachedResultName": "WB Marketing Campaigns",
+          "cachedResultUrl": "https://airtable.com/appW9hLpui1gEztZF"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tbl39nQC6JONrHWe1",
+          "mode": "list",
+          "cachedResultName": "Course Numbers",
+          "cachedResultUrl": "https://airtable.com/appW9hLpui1gEztZF/tbl39nQC6JONrHWe1"
+        },
+        "filterByFormula": "{Course Name} = \"الاستثمار الشهري وإدارة الثروة\"",
+        "options": {
+          "fields": [
+            "Course Number",
+            "Course Name",
+            "Course Type",
+            "Status",
+            "Date",
+            "Month",
+            "Enrolled Students"
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        304,
+        1264
+      ],
+      "id": "9468c476-ab83-46d0-8d88-b9dfc2df94a2",
+      "name": "Get Courses Instances (Inv)",
+      "notesInFlow": true,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "NFqjmZwVouJIyAfB",
+          "name": "All"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "__rl": true,
+          "value": "appW9hLpui1gEztZF",
+          "mode": "list",
+          "cachedResultName": "WB Marketing Campaigns",
+          "cachedResultUrl": "https://airtable.com/appW9hLpui1gEztZF"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblHNrKGKATOdV2np",
+          "mode": "list",
+          "cachedResultName": "Contacts",
+          "cachedResultUrl": "https://airtable.com/appW9hLpui1gEztZF/tblHNrKGKATOdV2np"
+        },
+        "filterByFormula": "=({Contact Id} = '{{ $json.body.id }}')",
+        "returnAll": false,
+        "limit": 1,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        80,
+        1456
+      ],
+      "id": "e8d63375-9266-4a37-8bc6-934e38e1face",
+      "name": "Find - Contact",
+      "notesInFlow": true,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "NFqjmZwVouJIyAfB",
+          "name": "All"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "__rl": true,
+          "value": "appW9hLpui1gEztZF",
+          "mode": "list",
+          "cachedResultName": "WB Marketing Campaigns",
+          "cachedResultUrl": "https://airtable.com/appW9hLpui1gEztZF"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tbl39nQC6JONrHWe1",
+          "mode": "list",
+          "cachedResultName": "Course Numbers",
+          "cachedResultUrl": "https://airtable.com/appW9hLpui1gEztZF/tbl39nQC6JONrHWe1"
+        },
+        "filterByFormula": "{Course Name} = \"الإدارة المالية الشخصية\"",
+        "options": {
+          "fields": [
+            "Course Number",
+            "Course Name",
+            "Course Type",
+            "Status",
+            "Date",
+            "Month",
+            "Enrolled Students"
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        304,
+        1456
+      ],
+      "id": "b34b2420-25e9-491a-a58d-2cdbd0c15b8e",
+      "name": "Get Courses Instances (Fin)",
+      "notesInFlow": true,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "NFqjmZwVouJIyAfB",
+          "name": "All"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "aggregateItems",
+        "aggregate": "aggregateAllItemData",
+        "destinationFieldName": "Courses"
+      },
+      "id": "5cb65af6-ba95-4931-9004-f56750eb4e06",
+      "name": "Combine Courses",
+      "type": "n8n-nodes-base.itemLists",
+      "typeVersion": 2.1,
+      "position": [
+        528,
+        1264
+      ],
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "aggregateItems",
+        "aggregate": "aggregateAllItemData",
+        "destinationFieldName": "Courses"
+      },
+      "id": "6d0cb6c2-9ae7-48a6-9a35-0e139978acf8",
+      "name": "Combine Courses (Fin)",
+      "type": "n8n-nodes-base.itemLists",
+      "typeVersion": 2.1,
+      "position": [
+        528,
+        1456
+      ],
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "972918d4-7193-4716-9c1d-2c0226592870",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -368,
+        1360
+      ],
+      "id": "ffc022ab-ef22-4c96-a514-e4832663b631",
+      "name": "Courses : Payment Confirmation",
+      "webhookId": "972918d4-7193-4716-9c1d-2c0226592870"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fetch = require('node-fetch');\n\n// I define the Airtable credentials and configuration\nconst personalAccessToken = 'patLu1tsO6OQv0sVe.9aa309808fc593eb51de73af9ea463a21c04b69566b8df75f49a06503ef6ba53';\nconst baseId = 'appW9hLpui1gEztZF';\nconst tableId = 'tbl39nQC6JONrHWe1'; // Courses Table\n\n// I retrieve the Courses array from the input\n// Note: Assuming the Code node is set to \"Run Once for All Items\" or dealing with the first item\nconst courses = $input.first().json.Courses;\n\n// I retrieve the Contact Record ID from the 'Find Contact' node\n// This ID is the one starting with 'rec...' needed for the Linked Record field\nconst contactRecordId = $('Find Contact').first().json.id;\n\nif (!courses || !Array.isArray(courses) || courses.length === 0) {\n  throw new Error(\"No courses found in the input.\");\n}\n\nif (!contactRecordId) {\n  throw new Error(\"Contact Record ID not found from 'Find Contact' node.\");\n}\n\n// --- LOGIC 1: Check for 'Enrollment Open' ---\nlet selectedCourse = courses.find(course => course.Status === 'Enrollment Open');\n\n// --- LOGIC 2: If not found, find the latest course based on Date ---\nif (!selectedCourse) {\n  // I create a copy to sort without mutating the original order unexpectedly\n  const sortedCourses = [...courses].sort((a, b) => {\n    // Convert date strings to Date objects for comparison (Descending order)\n    return new Date(b.Date) - new Date(a.Date);\n  });\n  \n  // I pick the first one (the latest/newest date)\n  selectedCourse = sortedCourses[0];\n}\n\n// Check if we successfully identified a course\nif (!selectedCourse) {\n  return {\n    json: {\n      message: \"No suitable course found (No 'Enrollment Open' and no valid dates).\"\n    }\n  };\n}\n\n// --- LOGIC 3: Prepare the Data for Update ---\n\n// I get the existing enrolled students (array of IDs) or initialize an empty array if null\nlet currentEnrolledStudents = selectedCourse['Enrolled Students'] || [];\n\n// I ensure it is an array (Airtable sometimes returns null for empty fields)\nif (!Array.isArray(currentEnrolledStudents)) {\n  currentEnrolledStudents = [];\n}\n\n// I verify if the contact is already enrolled to avoid duplicates\nif (!currentEnrolledStudents.includes(contactRecordId)) {\n  // I append the new Contact Record ID to the list\n  currentEnrolledStudents.push(contactRecordId);\n} else {\n  // Optional: Log if already enrolled, but we proceed to return the course info anyway\n  console.log(`Contact ${contactRecordId} is already enrolled in course ${selectedCourse['Course Name']}`);\n}\n\n// --- LOGIC 4: Update Airtable via API ---\n\nconst url = `https://api.airtable.com/v0/${baseId}/${tableId}/${selectedCourse.id}`;\n\nconst body = {\n  fields: {\n    \"Enrolled Students\": currentEnrolledStudents\n  }\n};\n\ntry {\n  // I send the PATCH request to update the record\n  const response = await fetch(url, {\n    method: 'PATCH',\n    headers: {\n      'Authorization': `Bearer ${personalAccessToken}`,\n      'Content-Type': 'application/json'\n    },\n    body: JSON.stringify(body)\n  });\n\n  const responseData = await response.json();\n\n  if (!response.ok) {\n    throw new Error(`Airtable API Error: ${JSON.stringify(responseData)}`);\n  }\n\n  // I return the updated course data\n  return {\n    json: {\n      status: \"Success\",\n      updatedCourse: responseData,\n      selectedLogic: selectedCourse.Status === 'Enrollment Open' ? \"Enrollment Open\" : \"Latest Date\"\n    }\n  };\n\n} catch (error) {\n  // I handle connection or API errors\n  throw new Error(`Failed to update Airtable: ${error.message}`);\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        1264
+      ],
+      "id": "9fda8be4-875c-423c-8a11-49a67405816a",
+      "name": "Enroll Contact (Fin)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fetch = require('node-fetch');\n\n// I define the Airtable credentials and configuration\nconst personalAccessToken = 'patLu1tsO6OQv0sVe.9aa309808fc593eb51de73af9ea463a21c04b69566b8df75f49a06503ef6ba53';\nconst baseId = 'appW9hLpui1gEztZF';\nconst tableId = 'tbl39nQC6JONrHWe1'; // Courses Table\n\n// I retrieve the Courses array from the input\n// Note: Assuming the Code node is set to \"Run Once for All Items\" or dealing with the first item\nconst courses = $input.first().json.Courses;\n\n// I retrieve the Contact Record ID from the 'Find Contact' node\n// This ID is the one starting with 'rec...' needed for the Linked Record field\nconst contactRecordId = $('Find - Contact').first().json.id;\n\nif (!courses || !Array.isArray(courses) || courses.length === 0) {\n  throw new Error(\"No courses found in the input.\");\n}\n\nif (!contactRecordId) {\n  throw new Error(\"Contact Record ID not found from 'Find Contact' node.\");\n}\n\n// --- LOGIC 1: Check for 'Enrollment Open' ---\nlet selectedCourse = courses.find(course => course.Status === 'Enrollment Open');\n\n// --- LOGIC 2: If not found, find the latest course based on Date ---\nif (!selectedCourse) {\n  // I create a copy to sort without mutating the original order unexpectedly\n  const sortedCourses = [...courses].sort((a, b) => {\n    // Convert date strings to Date objects for comparison (Descending order)\n    return new Date(b.Date) - new Date(a.Date);\n  });\n  \n  // I pick the first one (the latest/newest date)\n  selectedCourse = sortedCourses[0];\n}\n\n// Check if we successfully identified a course\nif (!selectedCourse) {\n  return {\n    json: {\n      message: \"No suitable course found (No 'Enrollment Open' and no valid dates).\"\n    }\n  };\n}\n\n// --- LOGIC 3: Prepare the Data for Update ---\n\n// I get the existing enrolled students (array of IDs) or initialize an empty array if null\nlet currentEnrolledStudents = selectedCourse['Enrolled Students'] || [];\n\n// I ensure it is an array (Airtable sometimes returns null for empty fields)\nif (!Array.isArray(currentEnrolledStudents)) {\n  currentEnrolledStudents = [];\n}\n\n// I verify if the contact is already enrolled to avoid duplicates\nif (!currentEnrolledStudents.includes(contactRecordId)) {\n  // I append the new Contact Record ID to the list\n  currentEnrolledStudents.push(contactRecordId);\n} else {\n  // Optional: Log if already enrolled, but we proceed to return the course info anyway\n  console.log(`Contact ${contactRecordId} is already enrolled in course ${selectedCourse['Course Name']}`);\n}\n\n// --- LOGIC 4: Update Airtable via API ---\n\nconst url = `https://api.airtable.com/v0/${baseId}/${tableId}/${selectedCourse.id}`;\n\nconst body = {\n  fields: {\n    \"Enrolled Students\": currentEnrolledStudents\n  }\n};\n\ntry {\n  // I send the PATCH request to update the record\n  const response = await fetch(url, {\n    method: 'PATCH',\n    headers: {\n      'Authorization': `Bearer ${personalAccessToken}`,\n      'Content-Type': 'application/json'\n    },\n    body: JSON.stringify(body)\n  });\n\n  const responseData = await response.json();\n\n  if (!response.ok) {\n    throw new Error(`Airtable API Error: ${JSON.stringify(responseData)}`);\n  }\n\n  // I return the updated course data\n  return {\n    json: {\n      status: \"Success\",\n      updatedCourse: responseData,\n      selectedLogic: selectedCourse.Status === 'Enrollment Open' ? \"Enrollment Open\" : \"Latest Date\"\n    }\n  };\n\n} catch (error) {\n  // I handle connection or API errors\n  throw new Error(`Failed to update Airtable: ${error.message}`);\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        1456
+      ],
+      "id": "9ac93044-9503-41ed-869b-058089279c01",
+      "name": "Enroll Contact (Inv)"
+    },
+    {
+      "parameters": {
+        "content": "                  Investment Course",
+        "height": 192,
+        "width": 896,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        32,
+        1424
+      ],
+      "typeVersion": 1,
+      "id": "8aa730ab-6b1c-4c47-9f0d-00ef9534ad38",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.CourseType }}",
+                    "rightValue": "Inv",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "e3cd4347-fae9-47ff-b6f9-fe7da12234b9"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Investment Course"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "72449386-c7c3-41ee-8969-2b5c24437dfa",
+                    "leftValue": "={{ $json.body.CourseType }}",
+                    "rightValue": "Fin",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Finance Course"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -144,
+        1360
+      ],
+      "id": "108a696d-3958-411b-8b6d-e55a0e82fc72",
+      "name": "Switch1"
+    },
+    {
+      "parameters": {
+        "content": "      When Student Payment Done",
+        "height": 272,
+        "width": 496
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -464,
+        1280
+      ],
+      "typeVersion": 1,
+      "id": "408b4b91-7c07-46eb-ac14-a5c74351f500",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "content": "                  Finance Course",
+        "height": 192,
+        "width": 896,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        32,
+        1232
+      ],
+      "typeVersion": 1,
+      "id": "a9022bdd-9f22-4c00-af71-81d4d3041012",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "batch1",
+              "type": "any"
+            }
+          ]
+        }
+      },
+      "id": "e5ca55df-d6fc-4bcd-9149-a1eb3d23cb56",
+      "typeVersion": 1.1,
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "position": [
+        -224,
+        576
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "fed5b6ff-b5d3-48f8-9315-44714de7f9de",
+      "name": "Replace me with your logic",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        464,
+        576
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "jsCode": "const fetch = require('node-fetch');\n\n// Get all input items from AI Results\nconst aiResults = $input.all();\n\n// Get conversation data from the other workflow\nconst conversationData = $('When Executed by Another Workflow').all();\n\n// Airtable configuration\nconst baseId = 'appW9hLpui1gEztZF';\nconst tableId = 'tblErbIV6Pybwlnta';\nconst accessToken = 'patLu1tsO6OQv0sVe.9aa309808fc593eb51de73af9ea463a21c04b69566b8df75f49a06503ef6ba53';\nconst airtableUrl = `https://api.airtable.com/v0/${baseId}/${tableId}`;\n\n// I create a map of conversation histories for quick lookup\nconst conversationMap = {};\nconversationData.forEach(item => {\n  if (item.json.batch1 && Array.isArray(item.json.batch1)) {\n    item.json.batch1.forEach(conv => {\n      conversationMap[conv.conversationId] = conv;\n    });\n  }\n});\n\n// I prepare the records array for Airtable\nconst records = [];\n\naiResults.forEach(item => {\n  const result = item.json;\n  \n  // I skip any failed results\n  if (result.status !== 'success') return;\n  \n  const conversationId = result.conversationId;\n  const contactId = result.contactId;\n  const classification = result.classification;\n  \n  // I get the conversation history from the map\n  const conversationInfo = conversationMap[conversationId];\n  const conversationHistory = conversationInfo ? conversationInfo.history : '';\n  \n  // I prepare the Airtable record\n  const record = {\n    fields: {\n      'Conversation Id': conversationId,\n      'ContactId': contactId,\n      'Conversation History': conversationHistory,\n      'Reasoning': classification.reasoning,\n      'Interests': JSON.stringify(classification.interests),\n      'Tags': classification.tag,\n      'Full Response': JSON.stringify(classification)\n    }\n  };\n  \n  records.push(record);\n});\n\n// I send the records to Airtable in batches (max 10 records per request)\nconst results = [];\nconst batchSize = 10;\n\nfor (let i = 0; i < records.length; i += batchSize) {\n  const batch = records.slice(i, i + batchSize);\n  \n  const response = await fetch(airtableUrl, {\n    method: 'POST',\n    headers: {\n      'Authorization': `Bearer ${accessToken}`,\n      'Content-Type': 'application/json'\n    },\n    body: JSON.stringify({ records: batch })\n  });\n  \n  const data = await response.json();\n  \n  if (!response.ok) {\n    throw new Error(`Airtable API error: ${JSON.stringify(data)}`);\n  }\n  \n  results.push(...data.records);\n}\n\n// I return the created records\nreturn [{ json: { created: results.length, records: results } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        576
+      ],
+      "id": "2e6c8856-f6ae-43a6-9a22-cd16a3339a58",
+      "name": "Airtable: Store ConversationH & AI Results"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fetch = require('node-fetch');\n\n// --------------------------------------------------------\n// 1. CONFIGURATION\n// --------------------------------------------------------\nconst GEMINI_API_KEY = 'AIzaSyDRb-WaY2dIUTTyIqQ9yWqe64-x1gmsFW0';\nconst API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';\nconst CONCURRENCY_LIMIT = 50;\n\n// --------------------------------------------------------\n// 2. STATIC PROMPTS & SCHEMA (FIXED)\n// --------------------------------------------------------\nconst SYSTEM_PROMPT = `# ROLE & MISSION\nYou are an expert CRM Data Analyst for \"Asem Alruhaily Financial Consulting\". Your mission is to analyze conversation transcripts and classify them into a structured JSON format.\n\n# BUSINESS CONTEXT\n**Services:** We offer \"Consultations\" (Appointments) and \"Training Courses\" (Products).\n**Consultations:** Personal Financial Plan, Couples Plan, Special Consultation. (These require booking/appointments).\n**Courses:** Personal Financial Management, Monthly Investment. (These are enrollments, NOT appointments).\n\n# CLASSIFICATION LOGIC\n## 1. Interests (Topics)\nExtract any interest in courses or consultations.\n**Allowed Topics (STRICT):** You must ONLY use one of these two exact values:\n  1. \"Personal Financial Management\"\n  2. \"Investment and Wealth Management\"\n**Time:** 'new' (discussed today) vs 'old' (discussed previously).\n\n## 2. Tags (Interaction Type)\nAssign a tag ONLY if the conversation fits one of these specific scenarios. **If none fit, do NOT assign a tag.**\n**\"Companies\"**: ONLY if the user represents a business/entity asking for B2B services, ads, or partnerships.\n**\"Appointment\"**: ONLY if the user is explicitly trying to book a **Consultation** (e.g., \"I want to book a meeting\", \"Is the consultant available?\").\n    - ⛔ **CRITICAL RULE:** Signing up for a **Course** is NOT an Appointment. Do NOT assign this tag for course enrollments.\n**\"General\"**: Only for vague greetings (\"Hello\") or off-topic chatter with NO specific interest in courses or services.\n\n## LOGICAL CONSTRAINTS\n**Independence:** You can have populated \\`interests\\` (e.g., user wants a course) with **NO** tag. This is the correct classification for a standard course sale.\n**Conflict:** If \\`interests\\` are found, the tag CANNOT be \"General\".\n**Priority:** \"Companies\" takes precedence over everything else.\n\n# OUTPUT FORMAT\nReturn valid JSON adhering strictly to the defined schema.`;\n\n// --------------------------------------------------------\n// 3. MAIN LOGIC\n// --------------------------------------------------------\nconst batchItems = $input.first().json.batch1;\n\nif (!batchItems || !Array.isArray(batchItems) || batchItems.length === 0) {\n  return [];\n}\n\nconst results = [];\nconst todayDate = new Date().toISOString().split('T')[0];\n\nasync function classifyConversation(item) {\n  const conversationHistory = item.history;\n  const conversationId = item.conversationId;\n  const contactId = item.contactId;\n\n  const userPrompt = `# INPUT DATA\n## Conversation history:\n<conversation_history>${conversationHistory}</conversation_history>\n## Now date (for reference):\n<now_date>${todayDate}</now_date>`;\n\n  const response = await fetch(`${API_URL}?key=${GEMINI_API_KEY}`, {\n    method: 'POST',\n    headers: {\n      'Content-Type': 'application/json'\n    },\n    body: JSON.stringify({\n      contents: [\n        {\n          role: 'user',\n          parts: [\n            { text: SYSTEM_PROMPT + '\\n\\n' + userPrompt }\n          ]\n        }\n      ],\n      generationConfig: {\n        responseMimeType: 'application/json',\n        responseSchema: {\n          type: 'object',\n          properties: {\n            reasoning: { type: 'string' },\n            interests: {\n              type: 'array',\n              items: {\n                type: 'object',\n                properties: {\n                  topic: {\n                    type: 'string',\n                    enum: [\n                      'Personal Financial Management',\n                      'Investment and Wealth Management'\n                    ]\n                  },\n                  time: { type: 'string', enum: ['new', 'old'] }\n                },\n                required: ['topic', 'time']\n              }\n            },\n            tag: {\n              type: 'string',\n              enum: ['Companies', 'General', 'Appointment']\n            }\n          },\n          required: ['reasoning', 'interests']\n        },\n        thinkingConfig: {\n          thinkingLevel: 'HIGH'\n        }\n      }\n    })\n  });\n\n  if (!response.ok) {\n    const errText = await response.text();\n    throw new Error(`API Error: ${response.status} - ${errText}`);\n  }\n\n  const data = await response.json();\n  const content = data.candidates[0].content.parts[0].text;\n  const parsedClassification = JSON.parse(content);\n\n  return {\n    json: {\n      status: 'success',\n      conversationId: conversationId,\n      contactId: contactId,\n      classification: parsedClassification\n    }\n  };\n}\n\nfor (let i = 0; i < batchItems.length; i += CONCURRENCY_LIMIT) {\n  const chunk = batchItems.slice(i, i + CONCURRENCY_LIMIT);\n  const promises = chunk.map(item => classifyConversation(item));\n  const chunkResults = await Promise.all(promises);\n  results.push(...chunkResults);\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        576
+      ],
+      "id": "f29f8adb-32a0-42b6-a6b7-f2dccf0a7c36",
+      "name": "Google: Gemini 3 Flash"
+    },
+    {
+      "parameters": {
+        "content": "## 100 Conversation",
+        "height": 256,
+        "width": 912
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -256,
+        512
+      ],
+      "typeVersion": 1,
+      "id": "58a9f733-8483-4aa8-bde1-14267421915e",
+      "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "unit": "minutes"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        128,
+        944
+      ],
+      "id": "d5b0fcdb-5ca0-4509-b163-2d530bd78db6",
+      "name": "5 Minutes Waiting",
+      "webhookId": "fb5e5f2f-412e-4888-a4e4-e1554ce48fcd"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Loop over input items and add a new field called 'myNewField' to the JSON of each one\nfor (const item of $input.all()) {\n  item.json.myNewField = 1;\n}\n\nreturn $input.all();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -96,
+        944
+      ],
+      "id": "0c989db8-e7c8-4005-bb89-559bfdddd841",
+      "name": "Xai: Grok 4 (Batch 1)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Loop over input items and add a new field called 'myNewField' to the JSON of each one\nfor (const item of $input.all()) {\n  item.json.myNewField = 1;\n}\n\nreturn $input.all();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        352,
+        944
+      ],
+      "id": "df068ec7-8fcd-464c-8348-002ddf3fb7e7",
+      "name": "Xai: Grok 4 (Batch 2)"
+    },
+    {
+      "parameters": {},
+      "id": "2405438e-afd1-43eb-abc4-a2e6d9a0fbaf",
+      "name": "Replace me with your logic1",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        576,
+        944
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## 200 Conversation",
+        "height": 256,
+        "width": 1120
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -352,
+        864
+      ],
+      "typeVersion": 1,
+      "id": "23cadafd-a45e-411c-ba41-2473ba5d8ff3",
+      "name": "Sticky Note7"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "4d5131a3-5cf0-4a46-a756-a905cf97e804",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -320,
+        944
+      ],
+      "id": "63ccf693-508f-497d-969d-3653f2b53c3f",
+      "name": "Webhook",
+      "webhookId": "4d5131a3-5cf0-4a46-a756-a905cf97e804"
+    }
+  ],
+  "pinData": {
+    "Daily Schedule": [
+      {
+        "json": {
+          "timestamp": "2025-12-21T00:00:37.013-05:00",
+          "Readable date": "December 21st 2025, 12:00:37 am",
+          "Readable time": "12:00:37 am",
+          "Day of week": "Sunday",
+          "Year": "2025",
+          "Month": "December",
+          "Day of month": "21",
+          "Hour": "00",
+          "Minute": "00",
+          "Second": "37",
+          "Timezone": "America/New_York (UTC-05:00)"
+        }
+      }
+    ],
+    "When Executed by Another Workflow": [
+      {
+        "json": {
+          "batch1": [
+            {
+              "conversationId": "al2gekG5kAmHXpzHMYPz",
+              "contactId": "DiHUvpWOp529CzsBSvf0",
+              "history": "[Team - 2025-11-08]: مرحباً بك في شركة عاصم الرحيلي للاستشارات المالية.\n> اوقات العمل: 10ص الى 6م  (الأحد الى الخميس)\n\nلخدمتك بشكل أفضل وضح لنا: \n▫️ الخدمة المطلوبة، أو مختصر موضوعك المالي.\n\nسيقوم فريقنا بالتواصل معك في أقرب وقت ممكن.\nشكراً لتواصلك معنا.\n[User - 2025-11-08]: السلام عليكم \nمن فضلك اخ أحمد\n ابغى اسأل عن مواعيد وعروض دورات الوعي المالي والاستثمار\n[AI Agent - 2025-11-08]: حياك الله أختي أروجا.\n[AI Agent - 2025-11-08]: بخصوص استفسارك، حالياً دورة \"الاستثمار الشهري وإدارة الثروة\" متاحة للتسجيل، وتبدأ بتاريخ 9 نوفمبر ورسومها 897 ريال.\n[AI Agent - 2025-11-08]: أما دورة \"الإدارة المالية الشخصية\" فالدورة الأخيرة انتهت، وإلى الآن لم يتحدد موعد الدورة القادمة. سيتم الإعلان عنها قريباً.\n[User - 2025-11-08]: أنا مهتمة بدورة الادارة المالية الشخصية \nمبدئيا الآن \nفمن فضلك ارغب بإنك تعطيني خبر عنها حتى اشترك فيها ان شاءالله\n[User - 2025-11-08]: حتكون اونلاين صح ؟\n[AI Agent - 2025-11-08]: صحيح، جميع دوراتنا تُقدم عن بعد عبر برنامج زوم.\n[AI Agent - 2025-11-08]: وأبشري، أول ما يتحدد موعد الدورة القادمة راح نعلن عنه مباشرة.\n[User - 2025-11-08]: فين تعلنوا عنه ؟\n[User - 2025-11-08]: ياليت تزودني بالرابط لو عندكم اكاونت في انستقرام او تيك توك\n[AI Agent - 2025-11-08]: الإعلان يتم هنا عن طريق الواتساب، وعبر حساب الأستاذ عاصم في تويتر. هذا هو الرابط: https://twitter.com/AsemEcono\n[AI Agent - 2025-11-08]: حالياً ما عندنا حساب في انستقرام أو تيك توك، لكن المحتوى المجاني متوفر على تويتر ويوتيوب.\n[AI Agent - 2025-11-08]: الإعلان يتم هنا عن طريق الواتساب، وعبر حساب الأستاذ عاصم في تويتر. هذا هو الرابط: https://twitter.com/AsemEcono\n[AI Agent - 2025-11-08]: حالياً ما عندنا حساب في انستقرام أو تيك توك، لكن المحتوى المجاني متوفر على تويتر ويوتيوب.\n[User - 2025-11-08]: شكرا لك\n[User - 2025-11-08]: في انتظارك انك تعطيني خبر الله يسعدك\n[AI Agent - 2025-11-08]: العفو، بالخدمة.\n[AI Agent - 2025-11-08]: العفو، بالخدمة.\n[Team - 2025-11-08]: ⭐️ خصم 55% لفترة محدودة\n\n💰استثمر مدخراتك وابدأ ببناء ثروتك!\n❓ تحس مدخراتك ما تنمو؟\n❓ ودك تستثمر بس ما تعرف من وين تبدأ؟\nدورة مُكثفه و مصممة تساعدك تبدأ تستثمر بطريقة صحيحة و بخطوات سهلة وعملية.\n\nوش راح تتعلم؟\n✅ استثمار مدخراتك شهريًا بطريقة بسيطة ومنظمة\n✅ بناء محفظة استثمارية تدر دخل إضافي مع الوقت\n✅ حماية أموالك من التضخم وتحقيق نمو حقيقي\n✅ وضع خطة استثمارية شخصية تناسب وضعك المالي وأهدافك\nخطتك الشهرية ما راح تاخذ منك أكثر من 10 دقائق شهرياً – ونتائجها تدوم!\n\n🔗 إذا فعلاً تبغى تبدأ، هذه فرصتك.\nسجّل الآن!:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\n📌 تفاصيل الدورة:\n🗓️ من 9 إلى 13 نوفمبر\n(خمسة أيام من 9/11/2025)\n⏰ 7:00م - 10:00م\n💻 أونلاين عبر Zoom\n💰 السعر بعد الخصم: 897 ريال فقط (بدلاً من ~2000 ريال~)\n\n🎁 المميزات للمشتركين:\n• حقيبة تدريبية وادوات مالية حصرية تساعدك على التطبيق والاستمرارية\n• بناء توزيعة وخطة استثمارية قابلة للتطبيق\n• وصول مدى الحياة لتحديثات ادوات الدورة وملفات الحقيبة\n• ⁠*افضل صناديق الاسثمار في ا\n[Team - 2025-11-08]: شكراً لاهتمامك بدوراتنا، \nلم  يتحدد بعد موعد الدورات التالية\n\nفور تحديد تفاصيل اطلاق الدورات التالية  سنقوم بإشعارك عبر الواتساب.\nكما يتم الاعلان عبر الموقع وحسابات الاستاذ عاصم (تويتر - سناب - يوتيوب)\n[User - 2025-11-16]: مساء الخير\n[AI Agent - 2025-11-16]: مساء النور. تفضلي، كيف أقدر أخدمك؟\n[User - 2025-11-16]: هل في خبر عن دورة الادارة المالية الشخصية \nإذا كان اتحدد موعدها او لا ؟\n[AI Agent - 2025-11-16]: إلى الآن ما تحدد موعد جديد للدورة.\n[AI Agent - 2025-11-16]: لكن أبشري، أول ما يتم تحديده راح نعلن عنه مباشرة.\n[User - 2025-11-16]: ياليت تبلغوني هنا في الواتس من فضلك\n[AI Agent - 2025-11-16]: أبشري، بالتأكيد. أول ما يتحدد الموعد سيتم الإعلان هنا مباشرة.\n[User - 2025-11-16]: ممتاز\nالله يعطيك العافيه\n[AI Agent - 2025-11-16]: الله يعافيك.\n[AI Agent - 2025-12-08]: 🌟خطوتك الأولى نحو الحرية المالية تبدأ من هنا\n\n❓ تواجه صعوبة في تنظيم دخلك؟\n❓ تحاول تدخر لكن المصاريف تسبقك؟\nهالدورة راح تغيّر طريقتك في التعامل مع المال بالكامل!\n\nوش راح تتعلم؟\n✅ بناء خطة مالية شخصية تناسب حياتك\n✅ إدارة المصاريف والتحكم بعاداتك المالية\n✅ التخلص من الديون وتجنّب الأزمات\n✅ صناعة فائض مالي يسهل ادخاره\n\n`كل هذا بأسلوب بسيط وعملي يناسب الجميع!`\n\n🔗 رابط التسجيل:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled12/formperma/_qW7nmeZCRHpKJgcx6R2tM3HgB57dWiLjMnfs9j1JFw?referrername=AH‬⁩\n\n📌 تفاصيل الدورة:\n🗓️ التاريخ: 14 & 15 ديسمبر\n⏰ الوقت: من 7:30م إلى 10:30م\n💻 عن بُعد (أونلاين عبر Zoom)\n\n💵 السعر بعد الخصم: 225 ريال فقط (بدلاً من ~450~)\n⚡ الخصم لفترة محدودة!\n\n🎁 المشتركين يحصلون على:\n• محتوى حصري و ملفات تدريبية وأدوات مالية مساعدة.\n• تطبيق عملي لطريقة الإدارة المالية الصفرية.\n\n📎 اضغط على رابط التسجيل لمزيد من التفاصيل\n\nللإيقاف استقبال الرسائل التسويقية ارسل كلمة \"إلغاء\" او \"قف\"\n[User - 2025-12-08]: [Media]\n[User - 2025-12-08]: السلام عليكم\n[User - 2025-12-08]: تم التسجيل في الدورة وسداد رسومها 👍🏻\n[AI Agent - 2025-12-08]: تم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة\nشكرًا لانضمامك معنا!\nتم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة 🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان: \nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ الموعد:\n🗓️ الاحد والاثنين، 14 - 15 ديسمبر\n⏰ 7:30م إلى 10:30م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط أدناه، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/10t9FgCiDFVw8X_KbpjgVoQAL6XD62o1X\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/stG5REcajkPAGgvtydTx\n*يُغلق قبل بدء الدورة*\n\nنتطلع لرؤيتك في الدورة! 🌟\n[AI Agent - 2025-12-08]: حياك الله أختي أريج.\n[AI Agent - 2025-12-08]: حياك الله أختي أريج. ممتاز، سيتم تأكيد تسجيلك قريبًا وبتوصلك رسالة التأكيد.\n[AI Agent - 2025-12-08]: حياك الله أختي أريج.\n[AI Agent - 2025-12-08]: حياك الله أختي أريج. ممتاز، سيتم تأكيد تسجيلك قريبًا وبتوصلك رسالة التأكيد.\n[AI Agent - 2025-12-08]: حياك الله أختي أريج.\n[AI Agent - 2025-12-08]: حياك الله أختي أريج. ممتاز، سيتم تأكيد تسجيلك قريبًا وبتوصلك رسالة التأكيد.\n[User - 2025-12-08]: بإسم أريج فالودة\n[AI Agent - 2025-12-08]: وصل، يعطيك العافية أختي أريج. تم استلام الاسم، وبيوصلك تأكيد التسجيل قريباً بإذن الله.\n[User - 2025-12-08]: الله يعافيك\n[AI Agent - 2025-12-10]: تم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة\nشكرًا لانضمامك معنا!\nتم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة 🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان: \nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ الموعد:\n🗓️ الاحد والاثنين، 14 - 15 ديسمبر\n⏰ 7:30م إلى 10:30م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط أدناه، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/10t9FgCiDFVw8X_KbpjgVoQAL6XD62o1X\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/stG5REcajkPAGgvtydTx\n*يُغلق قبل بدء الدورة*\n\nنتطلع لرؤيتك في الدورة! 🌟\n[AI Agent - 2025-12-10]: تم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة\nشكرًا لانضمامك معنا!\nتم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة 🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان: \nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ الموعد:\n🗓️ الاحد والاثنين، 14 - 15 ديسمبر\n⏰ 7:30م إلى 10:30م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط أدناه، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/10t9FgCiDFVw8X_KbpjgVoQAL6XD62o1X\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/stG5REcajkPAGgvtydTx\n*يُغلق قبل بدء الدورة*\n\nنتطلع لرؤيتك في الدورة! 🌟\n[AI Agent - 2025-12-10]: تم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة\nشكرًا لانضمامك معنا!\nتم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة 🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان: \nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ الموعد:\n🗓️ الاحد والاثنين، 14 - 15 ديسمبر\n⏰ 7:30م إلى 10:30م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط أدناه، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/10t9FgCiDFVw8X_KbpjgVoQAL6XD62o1X\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/stG5REcajkPAGgvtydTx\n*يُغلق قبل بدء الدورة*\n\nنتطلع لرؤيتك في الدورة! 🌟\n[Team - 2025-12-10]: ⚠️ لتحقيق أقصى استفادة من الدورة:\n\n1️⃣ نوصيك بقراءة تعليمات الدورة بعناية.\n\n2️⃣ حمّل ملفات الدورة على جهازك مباشرة، واستخدم الملفات من جهازك بدلًا من فتحها من قوقل درايف.\n\n3️⃣ تفقّد جميع أقسام بريدك الإلكتروني (بما فيها البريد المهمل/Spam)، فقد تصلك رسائل مهمة هناك.\n[User - 2025-12-14]: السلام عليكم\n[User - 2025-12-14]: هذه أنا كده تمام ؟\n[Team - 2025-12-14]: نعم 👍🏻\n[User - 2025-12-15]: صباح الخير \nهل تقصد في فقرة التسجيلات\nانكم سجلتوا اللقاء تبع أمس ؛ وأنكم حترسلوه لنا اليوم ؟\n\nلأن الصراحة ارغب في هذا الأمر لو كان متاح عندكم\n[AI Agent - 2025-12-15]: صباح النور أختي أريج.\n[AI Agent - 2025-12-15]: صحيح، اللقاء مسجل.\n[AI Agent - 2025-12-15]: التسجيلات متاحة للمشاهدة لمدة 6 أيام، وتفاصيل ورابط المشاهدة بيتم إرسالها لكم في مجموعة الواتساب الخاصة بالدورة.\n[User - 2025-12-15]: الله يبشرك بالخير\n[User - 2025-12-15]: ممتنة لك\n[User - 2025-12-15]: [Media]\n[User - 2025-12-15]: من فضلك أنا جالسه اتفرج على تسجيل أمس ، و وصلت لمنتصفه ؛ فهل إذا دخلت على رابط حضور الدورة تبع اليوم ، يروح علي تسجيل أمس ؟\n[Team - 2025-12-15]: لا عادي كمليه بعدين\n[Team - 2025-12-15]: تقدري توقفي الصفحه وترجعين لها لاحقا\nاو تعيدي فتح الرابط الي وصلك بالايميل\n\nاذا اكملتي مشاهدة عدد دقائق المقطع كامل وقتها يتوقف\n[User - 2025-12-15]: [Media]\n[User - 2025-12-15]: ما دخلني للآن\n[User - 2025-12-16]: [Media]\n[Team - 2025-12-19]: مرحبًا 👋🏻\n\nقبل 5 سنوات، طبّق عدد من المتدربين منهجيتنا الاستثمارية بانضباط.\n\nاليوم، نتائجهم تؤكد حقيقة واحدة:\nالاستمرار + خطة واضحة = نمو حقيقي.\n\nبـ 10 دقائق فقط شهريًا، ومن خلال طريقة بسيطة وقابلة للتعلّم،\nتستطيع بناء محفظة استثمارية تحقق نتائج ملموسة بهدوء مع مرور الوقت.\n\nهذه المنهجية ستتعلّمها معنا خلال 5 أيام تدريبية عملية.\n\n📌 دورة الاستثمار الشهري وإدارة الثروة\n💰 السعر: 897 ريال | ⏳ التسجيل متاح ليومين فقط\n\nستتعلم خلال الدورة:\n• بناء محفظة تناسب دخلك\n• حساب العائد والقيمة المستقبلية بوضوح\n• إنشاء خطة استثمار شهرية قابلة للتطبيق فورًا\n\n👤 المحاضر:\nأ. عاصم الرحيلي – مدرب ومدير ثروات معتمد بخبرة تتجاوز 25 سنة\n\n🗓 من الأحد إلى الخميس | 21 – 25 ديسمبر\n⏰ 7:30 – 10:30 مساءً\n🎥 عن بُعد (زوم) – مباشر وتفاعلي\n\nإذا رغبت ببناء محفظتك بخطوات واضحة،\nفهذا هو الوقت المناسب للبدء.\n👉 سجّل الآن https://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\nاكتب \"إالغاء\" أو قف اذا حاب نوقف الرسائل والاشعارات\n[User - 2025-12-20]: [Media]\n[User - 2025-12-20]: [Media]\n[User - 2025-12-21]: صباح الخير\n[User - 2025-12-21]: هل مازال متاح التسجيل في الدورة ؟\n",
+              "messageCount": 69,
+              "lastDirection": "inbound"
+            },
+            {
+              "conversationId": "SquCPy08eH2uHd9ZwqIz",
+              "contactId": "Ed5qbxiWlvpORQnavtyv",
+              "history": "[User - 2025-12-10]: السلام عليكم تم التسجيل والدفع\nباسم نوف راشد السويداء\n[Team - 2025-12-10]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[User - 2025-12-10]: Transaction-Receipt.pdf\n[Team - 2025-12-10]: وعليكم السلام ورحمة الله، حياك الله أخت نوف. وصلنا الإيصال، الله يبارك لك. راح يتم مراجعة الطلب وتأكيد تسجيلك، وبتوصلك رسالة تأكيد قريباً فيها كافة التفاصيل والتعليمات. بالخدمة.\n[Team - 2025-12-10]: تم تسجيل طلبك بدورة\nالاستثمار الشهري وإدارة الثروة📍 \n\nلإكمال تسجيلك قبل إغلاق التسجيل:\nحوّل رسوم الدورة المخفضة (897 ريال) على الحساب أدناه،\nوأرسل صورة الحوالة مع اسم المحول إلى واتساب: 0506445151\n\n• بنك الراجحي\n• رقم الحساب: 602608010781427\n• الآيبان: SA0780000602608010781427\n• اسم الحساب: مكتب عاصم الرحيلي للاستشارات المالية\n\n🔴 سارع بالسداد لإتمام انضمامك!\n[User - 2025-12-15]: متى الدورة؟\n[Team - 2025-12-15]: حياك الله أخت نوف.\n[Team - 2025-12-15]: دورة الاستثمار القادمة بتبدأ بإذن الله يوم الأحد 21 ديسمبر 2025.\n[User - 2025-12-15]: حياكم الله باذن الله ، هل راح راح تتم مشاركتنا الرابط؟ ومتى مواعيد توقيت بداية ونهاية الدورة\n[Team - 2025-12-21]: 📍 تم تسجيل طلبك بدورة\nالاستثمار الشهري وإدارة الثروة\n\nلإكمال تسجيلك قبل إغلاق التسجيل:\nحوّل رسوم الدورة المخفضة (897 ريال) على الحساب أدناه،\nوأرسل صورة الحوالة مع اسم المحول إلى واتساب: 0506445151\n\n• بنك الراجحي\n• رقم الحساب: 602608010781427\n• الآيبان: SA0780000602608010781427\n• اسم الحساب: مكتب عاصم الرحيلي للاستشارات المالية\n\n\n🔴 سارع بالسداد لإتمام انضمامك!\n⚠️ نحن على وشك الإغلاق\n[Team - 2025-12-21]: نأسف على الرسالة الخاطئة فضلا تجاهلي الرسالة اعلاه 👆🏻\n\n\nوايضا للأهمية فضلا الاطلاع على الرسالة التالية (اضغط على قراءة المزيد للمشاهدة الكاملة) \n👇🏻\n[Team - 2025-12-21]: [Media]\n[User - 2025-12-21]: اهلا وسهلا عافاك الله فعلا اليوم فقط وصلتني رسائل عبر الايميل راح اقراها\n[User - 2025-12-21]: تمام اضيفني بالقروب\n",
+              "messageCount": 14,
+              "lastDirection": "inbound"
+            },
+            {
+              "conversationId": "8Tojc8fhksTgYizAWW9Q",
+              "contactId": "glXYWFAqbU6WCoHXCMTo",
+              "history": "[Team - 2025-10-29]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[Team - 2025-10-29]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[User - 2025-10-29]: السلام عليكم \nلو تكرمت بكم الاستشارة الفردية\n[User - 2025-10-29]: السلام عليكم \nلو تكرمت بكم الاستشارة الفردية\n[AI Agent - 2025-10-29]: حياك الله يا Hsat.\n[Team - 2025-10-29]: حياك الله يا Hsat.\n[AI Agent - 2025-10-29]: الاستشارة المالية الخاصة تكلفتها 575 ريال شامل الضريبة.\n[Team - 2025-10-29]: الاستشارة المالية الخاصة تكلفتها 575 ريال شامل الضريبة.\n[AI Agent - 2025-10-29]: تقدر تحجز الموعد المناسب لك مباشرة من خلال هذا الرابط:\nhttps://booking.alruhaily.com\n[Team - 2025-10-29]: تقدر تحجز الموعد المناسب لك مباشرة من خلال هذا الرابط:\nhttps://booking.alruhaily.com\n[User - 2025-10-29]: الله يحييك \nكم مدتها وايش تشمل\n[AI Agent - 2025-10-29]: الاستشارة هي جلسة شخصية نجاوب فيها على استفساراتك المالية ونقدم لك أفضل النصائح حسب احتياجك.\n[Team - 2025-10-29]: الاستشارة هي جلسة شخصية نجاوب فيها على استفساراتك المالية ونقدم لك أفضل النصائح حسب احتياجك.\n[AI Agent - 2025-10-29]: تشمل مواضيع مثل القرارات المالية الكبيرة كشراء منزل أو سيارة، قرارات الاقتراض، التوجيه للاستثمار، تحديد الأهداف المالية، وحل مشاكل الديون.\n[Team - 2025-10-29]: تشمل مواضيع مثل القرارات المالية الكبيرة كشراء منزل أو سيارة، قرارات الاقتراض، التوجيه للاستثمار، تحديد الأهداف المالية، وحل مشاكل الديون.\n[User - 2025-10-29]: لقيت المدة في الرابط \nطيب أنا هدفي استثمار فأي استشارة مناسبة لي ؟\n[User - 2025-10-29]: أنا عارفة ميزانيتي وصرفي لكن ما أعرف أستثمر فهل تعطوني خطة ؟\n[AI Agent - 2025-10-29]: بخصوص الاستثمار، فيه خيارين أساسية ممكن تساعدك:\n[Team - 2025-10-29]: بخصوص الاستثمار، فيه خيارين أساسية ممكن تساعدك:\n[AI Agent - 2025-10-29]: 1. دورة الاستثمار الشهري وإدارة الثروة: هذي تعلمك المنهجية الكاملة خطوة بخطوة كيف تبني خطتك ومحفظتك الاستثمارية بنفسك. هي الخيار الأنسب لو تبغى تتعلم الأساسات بشكل صحيح وتدير استثماراتك بنفسك على المدى الطويل.\n[Team - 2025-10-29]: 1. دورة الاستثمار الشهري وإدارة الثروة: هذي تعلمك المنهجية الكاملة خطوة بخطوة كيف تبني خطتك ومحفظتك الاستثمارية بنفسك. هي الخيار الأنسب لو تبغى تتعلم الأساسات بشكل صحيح وتدير استثماراتك بنفسك على المدى الطويل.\n[AI Agent - 2025-10-29]: 2. استشارة مالية خاصة: هذي تكون جلسة مركزة مع المستشار لمناقشة وضعك المالي وتوجيهك بشكل مباشر لطريقة الاستثمار المناسبة لك، أو لو عندك استفسار محدد وحاب تأخذ فيه رأي خبير.\n[Team - 2025-10-29]: 2. استشارة مالية خاصة: هذي تكون جلسة مركزة مع المستشار لمناقشة وضعك المالي وتوجيهك بشكل مباشر لطريقة الاستثمار المناسبة لك، أو لو عندك استفسار محدد وحاب تأخذ فيه رأي خبير.\n[AI Agent - 2025-10-29]: صحيح، وهذا هو الوضع المثالي للبدء بالاستثمار.\n[Team - 2025-10-29]: صحيح، وهذا هو الوضع المثالي للبدء بالاستثمار.\n[AI Agent - 2025-10-29]: بما أن أمورك المالية مرتبة وهدفك هو تعلم الاستثمار وبناء خطة بنفسك، فالحل الأنسب لك هو \"دورة الاستثمار الشهري وإدارة الثروة\".\n[Team - 2025-10-29]: بما أن أمورك المالية مرتبة وهدفك هو تعلم الاستثمار وبناء خطة بنفسك، فالحل الأنسب لك هو \"دورة الاستثمار الشهري وإدارة الثروة\".\n[AI Agent - 2025-10-29]: الدورة مصممة عشان تأخذك من الصفر وتعلمك المنهجية العلمية لبناء محفظتك الاستثمارية بنفسك وتختار الأصول المناسبة لك سواء أسهم، عقار، أو غيرها. بنهاية الدورة بيكون عندك كل الأدوات والمعرفة اللي تحتاجها عشان تبني خطتك وتديرها بنفسك بثقة.\n[Team - 2025-10-29]: الدورة مصممة عشان تأخذك من الصفر وتعلمك المنهجية العلمية لبناء محفظتك الاستثمارية بنفسك وتختار الأصول المناسبة لك سواء أسهم، عقار، أو غيرها. بنهاية الدورة بيكون عندك كل الأدوات والمعرفة اللي تحتاجها عشان تبني خطتك وتديرها بنفسك بثقة.\n[Team - 2025-10-29]: الخدمة الانسب لهدفك هي دورة الاستثمار والتي ستوصلك للخطة الاستثمارية المناسبة لوضعك المالي واهدافك التي تحددها خلال الدورة\n[Team - 2025-10-29]: الخدمة الانسب لهدفك هي دورة الاستثمار والتي ستوصلك للخطة الاستثمارية المناسبة لوضعك المالي واهدافك التي تحددها خلال الدورة\n[Team - 2025-10-29]: ⭐️ خصم 55% لفترة محدودة\n\n💰استثمر مدخراتك وابدأ ببناء ثروتك!\n❓ تحس مدخراتك ما تنمو؟\n❓ ودك تستثمر بس ما تعرف من وين تبدأ؟\nدورة مُكثفه و مصممة تساعدك تبدأ تستثمر بطريقة صحيحة و بخطوات سهلة وعملية.\n\nوش راح تتعلم؟\n✅ استثمار مدخراتك شهريًا بطريقة بسيطة ومنظمة\n✅ بناء محفظة استثمارية تدر دخل إضافي مع الوقت\n✅ حماية أموالك من التضخم وتحقيق نمو حقيقي\n✅ وضع خطة استثمارية شخصية تناسب وضعك المالي وأهدافك\nخطتك الشهرية ما راح تاخذ منك أكثر من 10 دقائق شهرياً – ونتائجها تدوم!\n\n🔗 إذا فعلاً تبغى تبدأ، هذه فرصتك.\nسجّل الآن!:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\n📌 تفاصيل الدورة:\n🗓️ من 9 إلى 13 نوفمبر\n(خمسة أيام من 9/11/2025)\n⏰ 7:00م - 10:00م\n💻 أونلاين عبر Zoom\n💰 السعر بعد الخصم: 897 ريال فقط (بدلاً من ~2000 ريال~)\n\n🎁 المميزات للمشتركين:\n• حقيبة تدريبية وادوات مالية حصرية تساعدك على التطبيق والاستمرارية\n• بناء توزيعة وخطة استثمارية قابلة للتطبيق\n• وصول مدى الحياة لتحديثات ادوات الدورة وملفات الحقيبة\n• ⁠*افضل صناديق الاسثمار في السوق*\n[Team - 2025-10-29]: ⭐️ خصم 55% لفترة محدودة\n\n💰استثمر مدخراتك وابدأ ببناء ثروتك!\n❓ تحس مدخراتك ما تنمو؟\n❓ ودك تستثمر بس ما تعرف من وين تبدأ؟\nدورة مُكثفه و مصممة تساعدك تبدأ تستثمر بطريقة صحيحة و بخطوات سهلة وعملية.\n\nوش راح تتعلم؟\n✅ استثمار مدخراتك شهريًا بطريقة بسيطة ومنظمة\n✅ بناء محفظة استثمارية تدر دخل إضافي مع الوقت\n✅ حماية أموالك من التضخم وتحقيق نمو حقيقي\n✅ وضع خطة استثمارية شخصية تناسب وضعك المالي وأهدافك\nخطتك الشهرية ما راح تاخذ منك أكثر من 10 دقائق شهرياً – ونتائجها تدوم!\n\n🔗 إذا فعلاً تبغى تبدأ، هذه فرصتك.\nسجّل الآن!:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\n📌 تفاصيل الدورة:\n🗓️ من 9 إلى 13 نوفمبر\n(خمسة أيام من 9/11/2025)\n⏰ 7:00م - 10:00م\n💻 أونلاين عبر Zoom\n💰 السعر بعد الخصم: 897 ريال فقط (بدلاً من ~2000 ريال~)\n\n🎁 المميزات للمشتركين:\n• حقيبة تدريبية وادوات مالية حصرية تساعدك على التطبيق والاستمرارية\n• بناء توزيعة وخطة استثمارية قابلة للتطبيق\n• وصول مدى الحياة لتحديثات ادوات الدورة وملفات الحقيبة\n• ⁠*افضل صناديق الاسثمار في السوق*\n[User - 2025-10-29]: التسجيل لمدة كم متاح \nلأن الوقت غالبا ما بيكون مناسب\n[User - 2025-10-29]: عفوا أقصد التسجيل المرئي للمحاضرة نفسها\n[User - 2025-10-29]: هل أقدر أشوفه بأي وقت ؟\n[AI Agent - 2025-10-29]: نعم، يتم توفير تسجيل للدورة. التسجيل يكون متاح للمشاهدة لمدة 5 أيام من تاريخ بدء الدورة،\n[Team - 2025-10-29]: نعم، يتم توفير تسجيل للدورة. التسجيل يكون متاح للمشاهدة لمدة 5 أيام من تاريخ بدء الدورة،\n[AI Agent - 2025-10-29]: لكن فيه نقطة مهمة، وهي إن كل مقطع فيديو مسموح بمشاهدته مرة واحدة فقط. يعني تقدر توقف الفيديو وترجع تكمل، لكن بمجرد اكتمال مدته، تنتهي صلاحية مشاهدته.\n[Team - 2025-10-29]: عفواً للتصحيح يتم  اتاحة فيديو تسجيلات الدورة للمتدربين لمن يرغب المشاهدة المسجلة بوقت آخر او للمراجعة\n\nصلاحية التسجيلات تستمر 14 يوم من تاريخ الدورة\n[Team - 2025-10-29]: عفواً للتصحيح يتم  اتاحة فيديو تسجيلات الدورة للمتدربين لمن يرغب المشاهدة المسجلة بوقت آخر او للمراجعة\n\nصلاحية التسجيلات تستمر 14 يوم من تاريخ الدورة\n[User - 2025-10-29]: [Media]\n[User - 2025-10-29]: ممتاز جدا\nتم ✅️\n[Team - 2025-10-29]: لكن فيه نقطة مهمة، وهي إن كل مقطع فيديو مسموح بمشاهدته مرة واحدة فقط. يعني تقدر توقف الفيديو وترجع تكمل، لكن بمجرد اكتمال مدته، تنتهي صلاحية مشاهدته.\n[User - 2025-10-29]: إذا ممكن تسجل رغبتي بالمشاهدة في وقت آخر \nبحاول وقتها بس ما أظن ممكن\n[AI Agent - 2025-10-29]: ممتاز، يعطيك العافية. تأكد تسجيلك في دورة الاستثمار الشهري وإدارة الثروة.\n[User - 2025-10-29]: يعني ما أقدر أعيده أو أعيد جزء منه لو ما كان واضح ؟\n[Team - 2025-10-29]: ممتاز، يعطيك العافية. تأكد تسجيلك في دورة الاستثمار الشهري وإدارة الثروة.\n[AI Agent - 2025-10-29]: راح يتم إضافتك في قروب واتساب خاص بالدورة قبل موعدها، وهناك توصلك كل التفاصيل والروابط المهمة.\n[Team - 2025-10-29]: راح يتم إضافتك في قروب واتساب خاص بالدورة قبل موعدها، وهناك توصلك كل التفاصيل والروابط المهمة.\n[AI Agent - 2025-10-29]: ولو عندك أي استفسار ثاني حاضرين.\n[Team - 2025-10-29]: ولو عندك أي استفسار ثاني حاضرين.\n[AI Agent - 2025-10-29]: لا أبداً، المعلومة اللي ذكرتها لك سابقاً كانت غير دقيقة والصحيح هو كلام الزميل. التسجيلات تكون متاحة لك لمدة 14 يوم وتقدر تشوفها وتعيدها أي وقت خلال هذي الفترة للمراجعة.\n[Team - 2025-10-29]: لا أبداً، المعلومة اللي ذكرتها لك سابقاً كانت غير دقيقة والصحيح هو كلام الزميل. التسجيلات تكون متاحة لك لمدة 14 يوم وتقدر تشوفها وتعيدها أي وقت خلال هذي الفترة للمراجعة.\n[User - 2025-10-29]: ممتاز \nتهمني هذي النقطة\n[AI Agent - 2025-10-29]: بالخدمة.\n[Team - 2025-10-29]: بالخدمة.\n[AI Agent - 2025-10-29]: تم تأكيد تسجيلك في دورة الاستثمار الشهري وإدارة الثروة\nشكرًا لانضمامك معنا!  🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان:\nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ المتطلبات:\nتأكد من تثبيت البرنامجين التاليين على جهازك:\n🔹 Zoom\n🔹 Excel\n✅ الموعد:\n🗓️ الأحد إلى الخميس (9 إلى 13 نوفمبر 2025)\n⏰ 7:00م - 10:00م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/1RFoU3vxTqDmOU9k_Xf1Oc8G1yzICsl8H?usp=drive_link\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/Yy0R16xegmsMlRvTiPRF\n*يُغلق قبل بدء الدورة*\n\nنلقاكم قريبًا وبالتوفيق! 🌟\n[Team - 2025-10-29]: Unsupported message received\n[Team - 2025-10-29]: ⚠️ لتحقيق أقصى استفادة من الدورة:\n\n1️⃣ نوصيك بقراءة تعليمات الدورة بعناية.\n\n2️⃣ حمّل ملفات الدورة على جهازك مباشرة، واستخدم الملفات من جهازك بدلًا من فتحها من قوقل درايف.\n\n3️⃣ تفقّد جميع أقسام بريدك الإلكتروني (بما فيها البريد المهمل/Spam)، فقد تصلك رسائل مهمة هناك.\n[Team - 2025-10-29]: ⚠️ لتحقيق أقصى استفادة من الدورة:\n\n1️⃣ نوصيك بقراءة تعليمات الدورة بعناية.\n\n2️⃣ حمّل ملفات الدورة على جهازك مباشرة، واستخدم الملفات من جهازك بدلًا من فتحها من قوقل درايف.\n\n3️⃣ تفقّد جميع أقسام بريدك الإلكتروني (بما فيها البريد المهمل/Spam)، فقد تصلك رسائل مهمة هناك.\n[Team - 2025-11-12]: مرحباً بك في شركة عاصم الرحيلي للاستشارات المالية.\n> اوقات العمل: 10ص الى 6م  (الأحد الى الخميس)\n\nلخدمتك بشكل أفضل وضح لنا: \n▫️ الخدمة المطلوبة، أو مختصر موضوعك المالي.\n\nسيقوم فريقنا بالتواصل معك في أقرب وقت ممكن.\nشكراً لتواصلك معنا.\n[User - 2025-11-12]: السلام عليكم \nأنا أحد مشتركي الدورة الحالية \nجدا جدا سعيدة بالدورة للآن ثرية وممتعة وشرح الأستاذ رائع جدا كشخص من خارج هذا المجال وخبرتي جدا محدودة فيه.\n\nبس لو تكرمتوا رابط الزوم للقاء اليومي يُرسل على الايميل حتى يكون الدخول من اللاب توب أسهل.\nأمس وصلني فقط في الواتس اب.\n\nوشكرا\n[User - 2025-11-12]: .\n[User - 2025-12-03]: يعطيكم العافية أرجو، الرد\n[Team - 2025-12-03]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[Team - 2025-12-03]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[User - 2025-12-03]: بخصوص إرسال شهادات الدورة ١٠٢\n[Team - 2025-12-03]: حياك الله، الشهادات يتم اصدارها من المؤسسة العامة للتدريب التقني والمهني \nعبر منصتهم منار\n\nيوصلك اشعار عبر الايميل من منار وايضا من ادارة المركز التدريبي المرخص لدورتنا\n[Team - 2025-12-03]: حياك الله، الشهادات يتم اصدارها من المؤسسة العامة للتدريب التقني والمهني \nعبر منصتهم منار\n\nيوصلك اشعار عبر الايميل من منار وايضا من ادارة المركز التدريبي المرخص لدورتنا\n[Team - 2025-12-03]: اهلا بك\nبناء على الآلية من المؤسسة العامة للتدريب\nللحصول على الشهادة يتطلب الدخول لمنصة منار وطباعة الشهادة وفق الطريقة التالية:\n\nhttps://mnar.sa/auth/trainee/login\n*مهم جدا التسجيل بنفس الايميل الذي قمت بتسجيله في نموذج طلب الشهادة*\n\n-\tتسجيل دخول لاول مره .\n-\tادخال ايميلك المسجل بالدورة ، ومن ثم يصل لك رابط على الايميل تقوم بالضغط عليه واختيار كلمك مرور جديدة .\n-\t بعد تسجيل الدخول بالايميل والرقم السري الجديد تذهب لخيار دوراتي و تتم طباعة الشهادة من النظام. \n\nمتمنين لكم وافر النجاح والسداد\n[Team - 2025-12-03]: اهلا بك\nبناء على الآلية من المؤسسة العامة للتدريب\nللحصول على الشهادة يتطلب الدخول لمنصة منار وطباعة الشهادة وفق الطريقة التالية:\n\nhttps://mnar.sa/auth/trainee/login\n*مهم جدا التسجيل بنفس الايميل الذي قمت بتسجيله في نموذج طلب الشهادة*\n\n-\tتسجيل دخول لاول مره .\n-\tادخال ايميلك المسجل بالدورة ، ومن ثم يصل لك رابط على الايميل تقوم بالضغط عليه واختيار كلمك مرور جديدة .\n-\t بعد تسجيل الدخول بالايميل والرقم السري الجديد تذهب لخيار دوراتي و تتم طباعة الشهادة من النظام. \n\nمتمنين لكم وافر النجاح والسداد\n[User - 2025-12-03]: يعطيكم العافية \nتم التسجيل بنفس الايميل لكن الدورة لا تظهر\n[User - 2025-12-21]: السلام عليكم ا\n[User - 2025-12-21]: أخي الكريم تم حضور الدورة رقم ١٠٢ والتسجيل حسب التعليمات وحتى الآن لا تظهر الشهادة.\nأرجو سرعة التجاوب\n",
+              "messageCount": 75,
+              "lastDirection": "inbound"
+            },
+            {
+              "conversationId": "AIZ4arozzITZDobojLEb",
+              "contactId": "JCTHoBb5HR1k8sd6nVpC",
+              "history": "[Team - 2025-12-20]: تم تسجيل طلبك بدورة\nالاستثمار الشهري وإدارة الثروة📍 \n\nلإكمال تسجيلك قبل إغلاق التسجيل:\nحوّل رسوم الدورة المخفضة (897 ريال) على الحساب أدناه،\nوأرسل صورة الحوالة مع اسم المحول إلى واتساب: 0506445151\n\n• بنك الراجحي\n• رقم الحساب: 602608010781427\n• الآيبان: SA0780000602608010781427\n• اسم الحساب: مكتب عاصم الرحيلي للاستشارات المالية\n\n🔴 سارع بالسداد لإتمام انضمامك!\n[Team - 2025-12-21]: 📍 تم تسجيل طلبك بدورة\nالاستثمار الشهري وإدارة الثروة\n\nلإكمال تسجيلك قبل إغلاق التسجيل:\nحوّل رسوم الدورة المخفضة (897 ريال) على الحساب أدناه،\nوأرسل صورة الحوالة مع اسم المحول إلى واتساب: 0506445151\n\n• بنك الراجحي\n• رقم الحساب: 602608010781427\n• الآيبان: SA0780000602608010781427\n• اسم الحساب: مكتب عاصم الرحيلي للاستشارات المالية\n\n\n🔴 سارع بالسداد لإتمام انضمامك!\n⚠️ نحن على وشك الإغلاق\n[User - 2025-12-21]: السلام عليكم ورحمة الله.\nأنتهى التسجيل؟ \nأنا أحاول الدفع بالماستركارد ولكن يطلع لي error.\nالرجاء اخباري إذا لم ينتهي التسجيل.\nتحياتي وشكرا\n[Team - 2025-12-21]: وعليكم السلام ورحمة الله، حياك الله أستاذ مصطفى.\n[Team - 2025-12-21]: بما أنك تواجه مشكلة تقنية في الدفع، حولت استفسارك للفريق المختص حالاً عشان يتأكدون من حالة التسجيل ويساعدونك في حل المشكلة.\n[Team - 2025-12-21]: راح يتواصلون معك بأقرب وقت.\n[User - 2025-12-21]: سؤالي ياطويل العمر هل انتهى التسجيل او لا؟\nمشكلة الدفع يمكن تفاديها بالتحويل البنكي، اهم شيء اود معرفته ان التسجيل متاح حاليا.\n[Team - 2025-12-21]: حياك الله اخي مصطفى\nنظرا لضيق الوقت فضلا اتمام السداد عبر التحويل البنكي وارسال نسخه للحوالة\n[Team - 2025-12-21]: نعم متاح ولكننا على وشك الاغلاق خلال ساعة من الان\n[User - 2025-12-21]: طيب، شكرا جزيلا\n[User - 2025-12-21]: تم السداد\n[Team - 2025-12-21]: تم تأكيد تسجيلك في دورة الاستثمار الشهري وإدارة الثروة\nشكرًا لانضمامك معنا!  🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان:\nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ المتطلبات:\nتأكد من تثبيت البرنامجين التاليين على جهازك:\n🔹 Zoom\n🔹 Excel\n✅ الموعد:\n🗓️ الأحد إلى الخميس (21 إلى 25 ديسمبر 2025)\n⏰ 7:30م - 10:30م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/1RFoU3vxTqDmOU9k_Xf1Oc8G1yzICsl8H?usp=drive_link\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/Yy0R16xegmsMlRvTiPRF\n*يُغلق قبل بدء الدورة*\n\nنلقاكم قريبًا وبالتوفيق! 🌟\n[Team - 2025-12-21]: ⚠️ لتحقيق أقصى استفادة من الدورة:\n\n1️⃣ نوصيك بقراءة تعليمات الدورة بعناية.\n\n2️⃣ حمّل ملفات الدورة على جهازك مباشرة، واستخدم الملفات من جهازك بدلًا من فتحها من قوقل درايف.\n\n3️⃣ تفقّد جميع أقسام بريدك الإلكتروني (بما فيها البريد المهمل/Spam)، فقد تصلك رسائل مهمة هناك.\n",
+              "messageCount": 13,
+              "lastDirection": "outbound"
+            },
+            {
+              "conversationId": "cBUO0wS7Y1V0q8LotaJq",
+              "contactId": "wRSW2mgYsPMzL5lR9A51",
+              "history": "[Team - 2025-10-23]: *هل خطتك الاستثمارية مُحدّثة؟*\n\nمرحباً يحيى،\n\nلأنك شريك أساسي معنا (من المشاركين السابقين في دورة \"الاستثمار الشهري\")، نقدّم لك هذه الدعوة الحصرية للاحتفال معنا *بالدورة رقم 100!* 🥳\n\nمنذ أنهيت الدورة معنا، قد يراودك شعور بـ:\n• الحاجة للتأكد أن محفظتك ما زالت على المسار الصحيح.\n• الرغبة في معرفة *أحدث* الصناديق الاستثمارية المتاحة.\n• وجود أسئلة جديدة ظهرت مع التطبيق وتحتاج لإجابات مباشرة.\n\nلهذا السبب، صممنا لك ورشة عمل مركزة كـ *تكريم لك* ، ولتكون جواباً لهذه التساؤلات.\n\n*في 4 ساعات فقط، ستحصل على:*\n✅ *تحديث* لأهم الصناديق الاستثمارية المميزة.\n✅ *مراجعة* جوهرية لأساسيات بناء المحفظة.\n✅ *استشارات مباشرة* مع أ. عاصم الرحيلي لطرح أسئلتك.\n✅ *نماذج وخطط* استثمارية واقعية وجديدة.\n\n---\n*تفاصيل الحدث الحصري:*\n📅 *الموعد:* 1/11/2025\n⌛️ *الوقت:* من 6:00م إلى 10:00م\n💰 *رسوم رمزية (خاصة بك):* 100 ريال فقط (قبل الضريبة).\n\n🟢 *المقاعد محدودة جداً والتسجيل حصري للمشاركين السابقين فقط.*\n\nلا تفوّت فرصة شحذ مهاراتك وتحديث خطتك.\n[Team - 2025-10-24]: *هل خطتك الاستثمارية مُحدّثة؟*\n\nمرحباً يحيى،\n\nلأنك شريك أساسي معنا (من المشاركين السابقين في دورة \"الاستثمار الشهري\")، نقدّم لك هذه الدعوة الحصرية للاحتفال معنا *بالدورة رقم 100!* 🥳\n\nمنذ أنهيت الدورة معنا، قد يراودك شعور بـ:\n• الحاجة للتأكد أن محفظتك ما زالت على المسار الصحيح.\n• الرغبة في معرفة *أحدث* الصناديق الاستثمارية المتاحة.\n• وجود أسئلة جديدة ظهرت مع التطبيق وتحتاج لإجابات مباشرة.\n\nلهذا السبب، صممنا لك ورشة عمل مركزة كـ *تكريم لك* ، ولتكون جواباً لهذه التساؤلات.\n\n*في 4 ساعات فقط، ستحصل على:*\n✅ *تحديث* لأهم الصناديق الاستثمارية المميزة.\n✅ *مراجعة* جوهرية لأساسيات بناء المحفظة.\n✅ *استشارات مباشرة* مع أ. عاصم الرحيلي لطرح أسئلتك.\n✅ *نماذج وخطط* استثمارية واقعية وجديدة.\n\n---\n*تفاصيل الحدث الحصري:*\n📅 *الموعد:* 1/11/2025\n⌛️ *الوقت:* من 6:00م إلى 10:00م\n💰 *رسوم رمزية (خاصة بك):* 100 ريال فقط (قبل الضريبة).\n\n🟢 *المقاعد محدودة جداً والتسجيل حصري للمشاركين السابقين فقط.*\n\nلا تفوّت فرصة شحذ مهاراتك وتحديث خطتك.\n[Team - 2025-10-26]: *هل خطتك الاستثمارية مُحدّثة؟*\n\nمرحباً يحيى،\n\nلأنك شريك أساسي معنا (من المشاركين السابقين في دورة \"الاستثمار الشهري\")، نقدّم لك هذه الدعوة الحصرية للاحتفال معنا *بالدورة رقم 100!* 🥳\n\nمنذ أنهيت الدورة معنا، قد يراودك شعور بـ:\n• الحاجة للتأكد أن محفظتك ما زالت على المسار الصحيح.\n• الرغبة في معرفة *أحدث* الصناديق الاستثمارية المتاحة.\n• وجود أسئلة جديدة ظهرت مع التطبيق وتحتاج لإجابات مباشرة.\n\nلهذا السبب، صممنا لك ورشة عمل مركزة كـ *تكريم لك* ، ولتكون جواباً لهذه التساؤلات.\n\n*في 4 ساعات فقط، ستحصل على:*\n✅ *تحديث* لأهم الصناديق الاستثمارية المميزة.\n✅ *مراجعة* جوهرية لأساسيات بناء المحفظة.\n✅ *استشارات مباشرة* مع أ. عاصم الرحيلي لطرح أسئلتك.\n✅ *نماذج وخطط* استثمارية واقعية وجديدة.\n\n---\n*تفاصيل الحدث الحصري:*\n📅 *الموعد:* 1/11/2025\n⌛️ *الوقت:* من 6:00م إلى 10:00م\n💰 *رسوم رمزية (خاصة بك):* 100 ريال فقط (قبل الضريبة).\n\n🟢 *المقاعد محدودة جداً والتسجيل حصري للمشاركين السابقين فقط.*\n\nلا تفوّت فرصة شحذ مهاراتك وتحديث خطتك.\n[Team - 2025-10-27]: *هل خطتك الاستثمارية مُحدّثة؟*\n\nمرحباً يحيى،\n\nلأنك شريك أساسي معنا (من المشاركين السابقين في دورة \"الاستثمار الشهري\")، نقدّم لك هذه الدعوة الحصرية للاحتفال معنا *بالدورة رقم 100!* 🥳\n\nمنذ أنهيت الدورة معنا، قد يراودك شعور بـ:\n• الحاجة للتأكد أن محفظتك ما زالت على المسار الصحيح.\n• الرغبة في معرفة *أحدث* الصناديق الاستثمارية المتاحة.\n• وجود أسئلة جديدة ظهرت مع التطبيق وتحتاج لإجابات مباشرة.\n\nلهذا السبب، صممنا لك ورشة عمل مركزة كـ *تكريم لك* ، ولتكون جواباً لهذه التساؤلات.\n\n*في 4 ساعات فقط، ستحصل على:*\n✅ *تحديث* لأهم الصناديق الاستثمارية المميزة.\n✅ *مراجعة* جوهرية لأساسيات بناء المحفظة.\n✅ *استشارات مباشرة* مع أ. عاصم الرحيلي لطرح أسئلتك.\n✅ *نماذج وخطط* استثمارية واقعية وجديدة.\n\n---\n*تفاصيل الحدث الحصري:*\n📅 *الموعد:* 1/11/2025\n⌛️ *الوقت:* من 6:00م إلى 10:00م\n💰 *رسوم رمزية (خاصة بك):* 100 ريال فقط (قبل الضريبة).\n\n🟢 *المقاعد محدودة جداً والتسجيل حصري للمشاركين السابقين فقط.*\n\nلا تفوّت فرصة شحذ مهاراتك وتحديث خطتك.\n[Team - 2025-10-27]: *هل خطتك الاستثمارية مُحدّثة؟*\n\nمرحباً يحيى،\n\nلأنك شريك أساسي معنا (من المشاركين السابقين في دورة \"الاستثمار الشهري\")، نقدّم لك هذه الدعوة الحصرية للاحتفال معنا *بالدورة رقم 100!* 🥳\n\nمنذ أنهيت الدورة معنا، قد يراودك شعور بـ:\n• الحاجة للتأكد أن محفظتك ما زالت على المسار الصحيح.\n• الرغبة في معرفة *أحدث* الصناديق الاستثمارية المتاحة.\n• وجود أسئلة جديدة ظهرت مع التطبيق وتحتاج لإجابات مباشرة.\n\nلهذا السبب، صممنا لك ورشة عمل مركزة كـ *تكريم لك* ، ولتكون جواباً لهذه التساؤلات.\n\n*في 4 ساعات فقط، ستحصل على:*\n✅ *تحديث* لأهم الصناديق الاستثمارية المميزة.\n✅ *مراجعة* جوهرية لأساسيات بناء المحفظة.\n✅ *استشارات مباشرة* مع أ. عاصم الرحيلي لطرح أسئلتك.\n✅ *نماذج وخطط* استثمارية واقعية وجديدة.\n\n---\n*تفاصيل الحدث الحصري:*\n📅 *الموعد:* 1/11/2025\n⌛️ *الوقت:* من 6:00م إلى 10:00م\n💰 *رسوم رمزية (خاصة بك):* 100 ريال فقط (قبل الضريبة).\n\n🟢 *المقاعد محدودة جداً والتسجيل حصري للمشاركين السابقين فقط.*\n\nلا تفوّت فرصة شحذ مهاراتك وتحديث خطتك.\n[Team - 2025-10-27]: Unsupported message received\n[User - 2025-10-27]: تمام ارغب بالتسجيل\n[User - 2025-10-27]: [Media]\n[User - 2025-10-27]: [Media]\n[Team - 2025-10-29]: حياك الله\nالاسميل المسجل بالورشه مختلف عن الايميل المسجل سابقا\n\nهل هذا الايميل صحيح؟\nghhhj3422@gmail.com\n\n\nاذا غير صحيح فضلا ارسال الايميل الي نعتمده\n[Team - 2025-10-29]: حياك الله\nالاسميل المسجل بالورشه مختلف عن الايميل المسجل سابقا\n\nهل هذا الايميل صحيح؟\nghhhj3422@gmail.com\n\n\nاذا غير صحيح فضلا ارسال الايميل الي نعتمده\n[Team - 2025-10-29]: الايميل*\n[Team - 2025-10-29]: الايميل*\n[User - 2025-10-29]: هذا الايميل صحيح\n[User - 2025-10-29]: هل الورشه يوم السبت\n[Team - 2025-10-29]: نعم\n[Team - 2025-10-29]: نعم\n[AI Agent - 2025-10-29]: صحيح، الورشة بتكون يوم السبت تاريخ 1 نوفمبر.\n[Team - 2025-10-29]: صحيح، الورشة بتكون يوم السبت تاريخ 1 نوفمبر.\n[AI Agent - 2025-10-29]: شكرًا لإنضمامك معنا\nتم تأكيد تسجيلك بورشة العمل الإلحاقية بدورة الاستثمار الشهري 🎉\n\n🔴 معلومات هامة عن ورشة العمل:\n\n✅ المكان:\nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ المتطلبات:\nتأكد من تثبيت البرنامجين التاليين على جهازك:\n🔹 Zoom\n🔹 Excel\n✅ الموعد:\n🗓️ السبت  1-11-2025\n⏰ 4 ساعات من 6:00م - 10:00م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n\nنلقاكم قريبًا وبالتوفيق! 🌟\n[Team - 2025-10-29]: Unsupported message received\n[Team - 2025-10-31]: السلام عليكم \nمعاك احمد العنزي من شركة عاصم للاستشارات المالية\n[User - 2025-10-31]: وعليكم السلام ورحمة الله وبركاته\n[Team - 2025-10-31]: نود التنويه بسبب مشكلة تقنيه حصلت لنا في الواتساب رقمنا الاساسي لايعمل حالياً \n\nوحرصا حتى لانفقد المتدربين الذين قاموا بالسداد لورشة العمل رقم 100\n\nنرجو في حال قمت بالتحويل وضع لنا اسم الحساب المحول منه ونسخه لايصال التحويل\n[User - 2025-10-31]: يحي عبدربه جاسر الاحمدي\n[Team - 2025-10-31]: رقمنا الاساسي 0506445151\nلايعمل حاليا بسبب مشكلة تقنيه مع شركة ميتا وسيعود للعمل يوم الاحد\n\nورشة العمل ستقام غدا السبت لذا مؤقتا سنستخدم هذا الرقم الذي اراسلك منه\n[User - 2025-10-31]: تمام\n[Team - 2025-10-31]: [Media]\n[User - 2025-10-31]: [Media]\n[Team - 2025-10-31]: شكراً للتأكيد\n[User - 2025-11-25]: السلام عليكم ورحمة الله وبركاته \nاريد استشاره ماليه خاصه \nوشكرا\n[AI Agent - 2025-11-25]: وعليكم السلام ورحمة الله وبركاته، حياك الله أخوي يحيى.\n[AI Agent - 2025-11-25]: أبشر، تكلفة الاستشارة المالية الخاصة 575 ريال.\n[AI Agent - 2025-11-25]: تقدر تحجز الموعد المناسب لك مباشرة من خلال هذا الرابط: https://booking.alruhaily.com\n[AI Agent - 2025-12-07]: *عميلنا العزيز* 🌟،\n\nحرصًا منا على تأكيد حجزكم لخدمة استشارة مالية خاصة، والمحدد في يوم 12-18-2025 بتوقيت 11:30 صباحاً.\n\n نود تذكيركم بأهمية إتمام عملية السداد بمبلغ 575.\n\nللدفع 💳 : bit.ly/3KIuR4y\n\nنتطلع لخدمتك دائما.\nفي حال إتمام السداد عبر التحويل البنكي يرجى تجاهل الرسالة\n[Team - 2025-12-08]: ⚠️لخدمتك بأعلى كفاءة ممكنة وتقديم جلسة اسشارية مثالية\n\nيرجى تعبئة نموذج البيانات الاساسية 👇🏻\nhttps://forms.alruhaily.com/alruhaily/form/Untitled22/formperma/QQo0ThGenGQblUtIn9I75RJbv7r_DYTEYCAYxHz9Vhw?e=ghhhj3422%40gmail.com\n[AI Agent - 2025-12-08]: *تحية طيبة* 👋\n\nتم تأكيد موعدك لخدمة استشارة مالية خاصة\n\n📅 التاريخ و الوقت 18-12-2025 11:30  صباحاً\n\nالأستاذ عاصم بانتظار اتصالك!\n[User - 2025-12-08]: آلوقت الخميس ام الجمعه\nانا حجزت الخميس 17\nوليس الجمعه 18\n[Team - 2025-12-08]: الخميس عزيزي يحي التاريخ والوقت الي حجزتهم وصلتك من السستم رسالة تأكيد بالموعد عبر ايميلك وايضا عبر الواتساب\n[User - 2025-12-08]: [Media]\n[Team - 2025-12-18]: مرحبا، نود تذكيرك بموعدك اليوم الساعة 11:30 صباحاً لخدمة استشارة مالية خاصة.\nنراك على خير.\n[User - 2025-12-18]: ان شاءالله\n[User - 2025-12-18]: السلام عليكم ورحمة الله وبركاته\n[User - 2025-12-18]: اتصل على الاستاد عاصم مايرد\n[Team - 2025-12-18]: حياك الله\nالاستاذ عاصم ماتواصل معك للان؟\n[User - 2025-12-18]: لم يرد على اتصالاتي\n[User - 2025-12-18]: هل يوجد اتصال أم تم تاجيله\n[User - 2025-12-18]: اتمنى الرد هل تم التأجيل\n[Team - 2025-12-18]: نعتذر لك عزيزي يحي عن ماحصل اليوم\nاتضح ان الاستاذ عاصم واجه ظرف عاجل ولم يستطيع الرد على اتصالاتنا ولا اتصالك\n[Team - 2025-12-18]: الاستاذ عاصم بلغتي انه راح يتصل عليك\nهل كلمك او باقي\n[User - 2025-12-18]: لم يكلمني\nلقيت اتصاله الساعه  الواحده \nوالنصف\n[Team - 2025-12-19]: مرحبًا 👋🏻\n\nقبل 5 سنوات، طبّق عدد من المتدربين منهجيتنا الاستثمارية بانضباط.\n\nاليوم، نتائجهم تؤكد حقيقة واحدة:\nالاستمرار + خطة واضحة = نمو حقيقي.\n\nبـ 10 دقائق فقط شهريًا، ومن خلال طريقة بسيطة وقابلة للتعلّم،\nتستطيع بناء محفظة استثمارية تحقق نتائج ملموسة بهدوء مع مرور الوقت.\n\nهذه المنهجية ستتعلّمها معنا خلال 5 أيام تدريبية عملية.\n\n📌 دورة الاستثمار الشهري وإدارة الثروة\n💰 السعر: 897 ريال | ⏳ التسجيل متاح ليومين فقط\n\nستتعلم خلال الدورة:\n• بناء محفظة تناسب دخلك\n• حساب العائد والقيمة المستقبلية بوضوح\n• إنشاء خطة استثمار شهرية قابلة للتطبيق فورًا\n\n👤 المحاضر:\nأ. عاصم الرحيلي – مدرب ومدير ثروات معتمد بخبرة تتجاوز 25 سنة\n\n🗓 من الأحد إلى الخميس | 21 – 25 ديسمبر\n⏰ 7:30 – 10:30 مساءً\n🎥 عن بُعد (زوم) – مباشر وتفاعلي\n\nإذا رغبت ببناء محفظتك بخطوات واضحة،\nفهذا هو الوقت المناسب للبدء.\n👉 سجّل الآن https://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\nاكتب \"إالغاء\" أو قف اذا حاب نوقف الرسائل والاشعارات\n[User - 2025-12-21]: السلام عليكم ورحمة الله وبركاته \nكان موعدي يوم الخميس \nولم يتم التواصل \nماالجديد\n",
+              "messageCount": 53,
+              "lastDirection": "inbound"
+            },
+            {
+              "conversationId": "Ii0fh11hQLGhi792STIr",
+              "contactId": "QmVj8NOp48nmsS4mISwg",
+              "history": "[User - 2025-12-01]: السلام عليكم ورحمة الله وبركاته\n[Team - 2025-12-01]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[User - 2025-12-01]: يعطيكم العافية، بودي احجز جلسة استشارية الهدف منها تطوير خطة استثمارية شخصية.\n\nممكن التفاصيل للخدمة؟\n[Team - 2025-12-01]: حياك الله أستاذ عمر.\n[Team - 2025-12-01]: وعليكم السلام ورحمة الله وبركاته، حياك الله أستاذ عمر والمعذرة على التأخير.\n[Team - 2025-12-01]: بخصوص طلبك، الخدمة المناسبة هي \"الاستشارة المالية الخاصة\". في هذي الجلسة يتم مناقشة وضعك المالي وتوجيهك لمنهجية الاستثمار الأنسب لك ولأهدافك (الخدمة تركز على رسم الطريق والمنهجية ولا تشمل تقديم توصيات بأسهم محددة).\n[Team - 2025-12-01]: مدة الجلسة ساعة، ورسومها 575 ريال.\n[Team - 2025-12-01]: تقدر تختار الموعد المناسب لك (حضوري أو أونلاين) وتحجز مباشرة من هنا:\nhttps://booking.alruhaily.com\n[Team - 2025-12-01]: بخصوص طلبك، الخدمة المناسبة هي \"الاستشارة المالية الخاصة\"، وتكلفتها 575 ريال.\n[Team - 2025-12-01]: لكن ضروري أوضح لك نقطة مهمة: الجلسة نركز فيها على \"منهجية الاستثمار\" وتوزيع الأصول، ولا نقدم فيها خطة استثمارية جاهزة أو توصيات بأسهم وصناديق محددة.\n[Team - 2025-12-01]: إذا هذا الشيء مناسب لك، تقدر تحجز الموعد المتاح من هنا: https://booking.alruhaily.com\n\nأما إذا كنت حاب تتعلم كيف تبني خطتك ومحفظتك بنفسك بالتفصيل، فـ \"دورة الاستثمار\" بتكون الخيار الأفضل لك.\n[User - 2025-12-01]: سبق أخذت الدورة نفسها ،، هل صارت الدورة الان تخليك تبني خطة بنفسك أو مع أبو الوليد؟\n[Team - 2025-12-01]: الدورة مصممة عشان تعطيك الأدوات والمعرفة اللي تخليك تبني خطتك ومحفظتك بنفسك، وهذا هو هدفها الأساسي. يعني ما يتم فيها بناء الخطة بشكل مشترك أو خاص مع الأستاذ عاصم.\n[Team - 2025-12-01]: إذا كانت رغبتك هي مناقشة خطتك وتفاصيلها مع أبو الوليد شخصياً، فالخيار الأنسب لك هو \"الاستشارة المالية الخاصة\".\n[User - 2025-12-01]: ممتاز\n[User - 2025-12-01]: شكراً لكم\n[Team - 2025-12-03]: [Media]\n[Team - 2025-12-03]: [Media]\n[Team - 2025-12-19]: مرحبًا 👋🏻\n\nقبل 5 سنوات، طبّق عدد من المتدربين منهجيتنا الاستثمارية بانضباط.\n\nاليوم، نتائجهم تؤكد حقيقة واحدة:\nالاستمرار + خطة واضحة = نمو حقيقي.\n\nبـ 10 دقائق فقط شهريًا، ومن خلال طريقة بسيطة وقابلة للتعلّم،\nتستطيع بناء محفظة استثمارية تحقق نتائج ملموسة بهدوء مع مرور الوقت.\n\nهذه المنهجية ستتعلّمها معنا خلال 5 أيام تدريبية عملية.\n\n📌 دورة الاستثمار الشهري وإدارة الثروة\n💰 السعر: 897 ريال | ⏳ التسجيل متاح ليومين فقط\n\nستتعلم خلال الدورة:\n• بناء محفظة تناسب دخلك\n• حساب العائد والقيمة المستقبلية بوضوح\n• إنشاء خطة استثمار شهرية قابلة للتطبيق فورًا\n\n👤 المحاضر:\nأ. عاصم الرحيلي – مدرب ومدير ثروات معتمد بخبرة تتجاوز 25 سنة\n\n🗓 من الأحد إلى الخميس | 21 – 25 ديسمبر\n⏰ 7:30 – 10:30 مساءً\n🎥 عن بُعد (زوم) – مباشر وتفاعلي\n\nإذا رغبت ببناء محفظتك بخطوات واضحة،\nفهذا هو الوقت المناسب للبدء.\n👉 سجّل الآن https://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\nاكتب \"إالغاء\" أو قف اذا حاب نوقف الرسائل والاشعارات\n[User - 2025-12-20]: أهلاً\nأرغب بحجز هذه الخدمة الله يسعدك\n[Team - 2025-12-20]: حياك الله أستاذ عمر.\n[Team - 2025-12-20]: أبشر، تقدر تسجل في دورة الاستثمار الشهري وإدارة الثروة مباشرة من خلال هذا الرابط: https://bit.ly/3KUcCVZ\n[Team - 2025-12-20]: الدورة تبدأ غداً الأحد إن شاء الله، بالتوفيق لك.\n[User - 2025-12-20]: اقصد استشارة مالية خاصة :)\n[Team - 2025-12-20]: ولا يهمك، أبشر.\n[Team - 2025-12-20]: تقدر تحجز موعد الاستشارة المالية الخاصة مباشرة من خلال هذا الرابط: https://booking.alruhaily.com\n[User - 2025-12-20]: هل هناك قسيمة خصم عميل مستمر؟ :)\n[Team - 2025-12-20]: *عميلنا العزيز* 🌟،\n\nحرصًا منا على تأكيد حجزكم لخدمة استشارة مالية خاصة، والمحدد في يوم 12-29-2025 بتوقيت 06:30 مساءً.\n\n نود تذكيركم بأهمية إتمام عملية السداد بمبلغ 575.\n\nللدفع 💳 : bit.ly/4s7lZWV\n\nنتطلع لخدمتك دائما.\nفي حال إتمام السداد عبر التحويل البنكي يرجى تجاهل الرسالة\n[User - 2025-12-20]: .\n[Team - 2025-12-20]: نأسف لايوجد خصم للخدمات الاستشارية\n[User - 2025-12-20]: إتمام الطلب - شركة عاصم الرحيلي للاستشارات المالية.pdf\n[Team - 2025-12-20]: *تحية طيبة* 👋\n\nتم تأكيد موعدك لخدمة استشارة مالية خاصة\n📅 التاريخ و الوقت 29-12-2025 06:30  مساءً\n\nالأستاذ عاصم سيكون بانتظارك في المكتب - حي الصحافة ، شارع العليا\n\nhttps://maps.app.goo.gl/9DHQxDEiWcc3tB6E6\n\nالمكتب في الدور الأول - باب رقم 4\n[Team - 2025-12-21]: ⚠️لخدمتك بأعلى كفاءة ممكنة وتقديم جلسة اسشارية مثالية\n\nيرجى تعبئة نموذج البيانات الاساسية 👇🏻\nhttps://forms.alruhaily.com/alruhaily/form/Untitled22/formperma/QQo0ThGenGQblUtIn9I75RJbv7r_DYTEYCAYxHz9Vhw?e=u.u.g%40hotmail.com\n[User - 2025-12-21]: تم\n",
+              "messageCount": 34,
+              "lastDirection": "inbound"
+            },
+            {
+              "conversationId": "SXdDUE8a5fqAjOcfJANC",
+              "contactId": "J0tst3HlqL7BFfdiwOQn",
+              "history": "[User - 2025-12-20]: تكرما \nاود معرفة جدول للدورات\n[Team - 2025-12-20]: حياك الله أخوي سلمان. حالياً لم يتم تحديد مواعيد الدورات القادمة، وبمجرد اعتماد الجدول الجديد بنعلن عنه هنا وعبر حساب الأستاذ عاصم في تويتر.\n[Team - 2025-12-20]: بإمكانك الاطلاع على تفاصيل الدورات والتسجيل من هنا:\n[Team - 2025-12-20]: دورة الإدارة المالية: https://zfrmz.com/amXhmraSiGFYJhBd7fGc\n[Team - 2025-12-20]: دورة الاستثمار: https://bit.ly/3KUcCVZ\n[Team - 2025-12-20]: ⭐️ خصم 55% لفترة محدودة\n\n💰استثمر مدخراتك وابدأ ببناء ثروتك!\n❓ تحس مدخراتك ما تنمو؟\n❓ ودك تستثمر بس ما تعرف من وين تبدأ؟\nدورة مُكثفه و مصممة تساعدك تبدأ تستثمر بطريقة صحيحة و بخطوات سهلة وعملية.\n\nوش راح تتعلم؟\n✅ استثمار مدخراتك شهريًا بطريقة بسيطة ومنظمة\n✅ بناء محفظة استثمارية تدر دخل إضافي مع الوقت\n✅ حماية أموالك من التضخم وتحقيق نمو حقيقي\n✅ وضع خطة استثمارية شخصية تناسب وضعك المالي وأهدافك\nخطتك الشهرية ما راح تاخذ منك أكثر من 10 دقائق شهرياً – ونتائجها تدوم!\n\n🔗 إذا فعلاً تبغى تبدأ، هذه فرصتك.\nسجّل الآن!:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\n📌 تفاصيل الدورة:\n🗓️ من 21 إلى 25 ديسمبر \n(خمسة أيام من 21/12/2025)\n⏰ 7:30م - 10:30م\n💻 أونلاين عبر Zoom\n💰 السعر بعد الخصم: 897 ريال فقط (بدلاً من ~2000 ريال~)\n\n🎁 المميزات للمشتركين:\n• حقيبة تدريبية وادوات مالية حصرية تساعدك على التطبيق والاستمرارية\n• بناء توزيعة وخطة استثمارية قابلة للتطبيق\n• وصول مدى الحياة لتحديثات ادوات الدورة وملفات الحقيبة\n• ⁠*افضل صناديق الاسثمار في السوق*\n[Team - 2025-12-20]: تم تسجيل طلبك بدورة\nالاستثمار الشهري وإدارة الثروة📍 \n\nلإكمال تسجيلك قبل إغلاق التسجيل:\nحوّل رسوم الدورة المخفضة (897 ريال) على الحساب أدناه،\nوأرسل صورة الحوالة مع اسم المحول إلى واتساب: 0506445151\n\n• بنك الراجحي\n• رقم الحساب: 602608010781427\n• الآيبان: SA0780000602608010781427\n• اسم الحساب: مكتب عاصم الرحيلي للاستشارات المالية\n\n🔴 سارع بالسداد لإتمام انضمامك!\n[Team - 2025-12-21]: 📍 تم تسجيل طلبك بدورة\nالاستثمار الشهري وإدارة الثروة\n\nلإكمال تسجيلك قبل إغلاق التسجيل:\nحوّل رسوم الدورة المخفضة (897 ريال) على الحساب أدناه،\nوأرسل صورة الحوالة مع اسم المحول إلى واتساب: 0506445151\n\n• بنك الراجحي\n• رقم الحساب: 602608010781427\n• الآيبان: SA0780000602608010781427\n• اسم الحساب: مكتب عاصم الرحيلي للاستشارات المالية\n\n\n🔴 سارع بالسداد لإتمام انضمامك!\n⚠️ نحن على وشك الإغلاق\n[User - 2025-12-21]: حوالة صادرة محلية\r\nمن:0100*\r\nإلى:ASIM A. DHAI******\r\nعبر:AL RAJHI BANK\r\nآيبان:*1427\r\nمبلغ:897 SAR\r\nفي:21/12/25 09:42\n[User - 2025-12-21]: سلمان عمران الحرز\n[Team - 2025-12-21]: وصلت الحوالة والاسم، الله يعطيك العافية أخوي سلمان.\n[Team - 2025-12-21]: بيتم تأكيد تسجيلك وبتوصلك رسالة التأكيد قريباً بإذن الله.\n[Team - 2025-12-21]: تم تأكيد تسجيلك في دورة الاستثمار الشهري وإدارة الثروة\nشكرًا لانضمامك معنا!  🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان:\nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ المتطلبات:\nتأكد من تثبيت البرنامجين التاليين على جهازك:\n🔹 Zoom\n🔹 Excel\n✅ الموعد:\n🗓️ الأحد إلى الخميس (21 إلى 25 ديسمبر 2025)\n⏰ 7:30م - 10:30م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/1RFoU3vxTqDmOU9k_Xf1Oc8G1yzICsl8H?usp=drive_link\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/Yy0R16xegmsMlRvTiPRF\n*يُغلق قبل بدء الدورة*\n\nنلقاكم قريبًا وبالتوفيق! 🌟\n[Team - 2025-12-21]: ⚠️ لتحقيق أقصى استفادة من الدورة:\n\n1️⃣ نوصيك بقراءة تعليمات الدورة بعناية.\n\n2️⃣ حمّل ملفات الدورة على جهازك مباشرة، واستخدم الملفات من جهازك بدلًا من فتحها من قوقل درايف.\n\n3️⃣ تفقّد جميع أقسام بريدك الإلكتروني (بما فيها البريد المهمل/Spam)، فقد تصلك رسائل مهمة هناك.\n",
+              "messageCount": 14,
+              "lastDirection": "outbound"
+            },
+            {
+              "conversationId": "n6pzhk27ysfBEpMAIZZQ",
+              "contactId": "q5H4ybSQnvTLZKsBntJd",
+              "history": "[User - 2025-12-14]: السلام عليكم و رحمه الله و بركاته\nيسعد مساءك حاب اعرف الدورات الي تقدموها و الاستشارات المالية كم تكلفتها\n[Team - 2025-12-14]: وعليكم السلام ورحمة الله وبركاته، حياك الله أخوي أسامة.\n[Team - 2025-12-14]: بخصوص الدورات، نقدم دورتين أساسية: دورة الإدارة المالية الشخصية تركز على ضبط المصاريف والادخار (سعرها 225 ريال)، ودورة الاستثمار الشهري تعلمك كيف تبني محفظتك الاستثمارية بنفسك (سعرها 897 ريال).\n[Team - 2025-12-14]: أما الاستشارات فأسعارها تختلف حسب النوع: الاستشارة الخاصة (لمناقشة موضوع محدد) 575 ريال، والخطة المالية الشخصية (شاملة) 1450 ريال، والخطة المالية للأسرة 1950 ريال.\n[Team - 2025-12-14]: آمرني، أي خدمة منهم تشوفها تناسب احتياجك الحالي؟\n[User - 2025-12-14]: هل في تفاصيل اكثر عن الدورة الخاصة بالاستثمار الشهري\n[Team - 2025-12-14]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[User - 2025-12-14]: بالنسبة لهذي فراس اسال الوالد و اشوف ايش الي يناسبة\n[Team - 2025-12-14]: ⭐️ خصم 55% لفترة محدودة\n\n💰استثمر مدخراتك وابدأ ببناء ثروتك!\n❓ تحس مدخراتك ما تنمو؟\n❓ ودك تستثمر بس ما تعرف من وين تبدأ؟\nدورة مُكثفه و مصممة تساعدك تبدأ تستثمر بطريقة صحيحة و بخطوات سهلة وعملية.\n\nوش راح تتعلم؟\n✅ استثمار مدخراتك شهريًا بطريقة بسيطة ومنظمة\n✅ بناء محفظة استثمارية تدر دخل إضافي مع الوقت\n✅ حماية أموالك من التضخم وتحقيق نمو حقيقي\n✅ وضع خطة استثمارية شخصية تناسب وضعك المالي وأهدافك\nخطتك الشهرية ما راح تاخذ منك أكثر من 10 دقائق شهرياً – ونتائجها تدوم!\n\n🔗 إذا فعلاً تبغى تبدأ، هذه فرصتك.\nسجّل الآن!:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\n📌 تفاصيل الدورة:\n🗓️ من 21 إلى 25 ديسمبر \n(خمسة أيام من 21/12/2025)\n⏰ 7:30م - 10:30م\n💻 أونلاين عبر Zoom\n💰 السعر بعد الخصم: 897 ريال فقط (بدلاً من ~2000 ريال~)\n\n🎁 المميزات للمشتركين:\n• حقيبة تدريبية وادوات مالية حصرية تساعدك على التطبيق والاستمرارية\n• بناء توزيعة وخطة استثمارية قابلة للتطبيق\n• وصول مدى الحياة لتحديثات ادوات الدورة وملفات الحقيبة\n• ⁠*افضل صناديق الاسثمار في السوق*\n[Team - 2025-12-14]: الافضل لخدمتك بشكل ادق، فضلًا توضيح مختصر موضوعك المالي او هدفك من الإستشارة\n\nوراح نرشدك للخدمة الانسب لك ولموضوعك\n[Team - 2025-12-14]: أبشر، هذي الدورة هي دليلك العملي لبناء ثروة للمستقبل.\n[Team - 2025-12-14]: الدورة مدتها 5 أيام (أونلاين)، وتأخذك من الصفر حتى الاحتراف في توزيع أصولك الاستثمارية (أسهم، عقار، ذهب، صناديق). راح تتعلم كيف تبني خطة استثمارية تناسب دخلك وأهدافك، وكيف تختار الصناديق الاستثمارية الأفضل بناءً على أدائها.\n[Team - 2025-12-14]: الدورة القادمة بتبدأ يوم 21 ديسمبر، وسعرها 897 ريال.\n[Team - 2025-12-14]: تحب أرسل لك رابط التسجيل؟\n[Team - 2025-12-14]: الله يحييك ويحفظ الوالد. خذوا وقتكم، ومتى ما قررتوا أو صار عندكم أي استفسار، أنا موجود وبالخدمة.\n[User - 2025-12-14]: الوالد حاليا متقاعد بس مافي راتب تقاعد لاننا غير سعودين و لديه ثروة تقدر ٣.٦ مليون  كاش و ١.٥ على شكل اصول عقارية و حابين نستثمرها بافضل طريقة بحيث تولد له دخل مع تغطية تكاليفه الشخصية.\n[User - 2025-12-14]: ايت افضل باقة له\n[Team - 2025-12-14]: ما شاء الله تبارك الله، الله يبارك للوالد في ماله ويمتعه بالصحة والعافية.\n[Team - 2025-12-14]: بناءً على المبلغ المتوفر (الله يزيده) والهدف اللي ذكرته وهو \"توليد دخل\" لتغطية المصاريف، الخيار الأنسب والأفضل له هو \"دورة الاستثمار وإدارة الثروة\".\n[Team - 2025-12-14]: السبب أننا في الاستشارات الخاصة (حسب التراخيص) لا نقدم توصيات استثمارية مباشرة أو إدارة محافظ، بينما في الدورة سيتعلم الوالد (أو أنت إذا كنت بتديرها عنه) المنهجية الكاملة لتوزيع هذا المبلغ على أصول تدر دخل دوري (مثل الصكوك، صناديق الريت، وأسهم التوزيعات) بطريقة آمنة تحافظ على رأس المال وتوفر السيولة اللي يحتاجها.\n[Team - 2025-12-14]: الدورة بتعطيكم \"الخطة\" والمنهجية اللي تمشون عليها لسنوات قدام. هل تحب تعتمد التسجيل فيها؟\n[Team - 2025-12-14]: [Media]\n[User - 2025-12-14]: الله يبارك بعمرك\n[User - 2025-12-14]: انا حاليا الي ادير اصوله و مقضيها حاليا في الودائع البنكية الى ان اخذ ثقة في رفع المخاطر بشكل تدريجي لانه ما عندنا المعرفة المالية بشكل كبير و شفت البردوكسات كيف تعتني بنفسك والله يزيدكم من العلم و المنفعه و الاثر الطيب\n[User - 2025-12-14]: هل الدورة بشكل شهري يعني لو حتى دفعتها الان بس حتكون متوفرة في شهر يناير\n[Team - 2025-12-14]: صحيح، وهذا عين العقل يا أسامة. القاعدة الذهبية هي \"لا تستثمر فيما لا تفهم\"، وبقاؤك في الودائع لحين اكتساب المعرفة هو القرار الأسلم لحماية رأس المال.\n[Team - 2025-12-14]: الدورة صممت خصيصاً لهذا الغرض: أنها تنقلك من مرحلة \"الادخار في الودائع\" إلى \"بناء محفظة استثمارية متكاملة\" توزع فيها المخاطر وتنمي المال، وأنت واثق من كل خطوة.\n[Team - 2025-12-14]: بما أنك القائم على الإدارة، استثمارك في تعلم المنهجية الصحيحة هو أفضل قرار تتخذه لحماية وتنمية ثروة الوالد.\n[Team - 2025-12-14]: الدورة بتبدأ الأسبوع الجاي (21 ديسمبر)، هل نعتمد تسجيلك ونرسل الرابط؟\n[Team - 2025-12-14]: الدورة تقام بشكل دوري، لكن التسجيل المتاح حالياً هو لدفعة 21 ديسمبر.\n[Team - 2025-12-14]: بخصوص شهر يناير، لسه ما تحدد موعد الدورة القادمة، فالأفضل بما أنك ماسك الإدارة حالياً أنك تستغل الفرصة وتبدأ معنا الأسبوع الجاي عشان ترتب الأمور وتدخل السنة الجديدة بخطة واضحة.\n[Team - 2025-12-14]: هل الوقت مناسب لك؟\n[Team - 2025-12-14]: ماتحدد متى موعد الدورة القادمة\n\nولكن في الغالب نعم يناير حيكون فيه دورة ولكن غير اكيد\n\n\nاذا تحب تسجل في الدورة لان ثم نؤجل حضورك لها فهذا الخيار متاح وممكن نخدمك فيه\n[Team - 2025-12-14]: [Media]\n[User - 2025-12-14]: تمام حاب اسجل و راح اكد لكم هذا الاسبوع ان كان هذا الشهر و لا الشهر الي بعده\n[Team - 2025-12-14]: على بركة الله، خيار موفق.\n[Team - 2025-12-14]: تقدر تكمل تسجيلك الآن عشان تضمن المقعد، ومتى ما تأكدت من الموعد المناسب لك (سواء هذا الشهر أو الجاي) بس خبرنا هنا ونعتمد لك الحضور، الأمر بسيط جداً وأبشر.\n[Team - 2025-12-14]: رابط التسجيل: https://bit.ly/3KUcCVZ\n[User - 2025-12-14]: [Media]\n[Team - 2025-12-14]: وصلت، الله يعطيك العافية يا أسامة.\n[Team - 2025-12-14]: راح يتم تأكيد تسجيلك وبتوصلك رسالة التأكيد قريباً بإذن الله.\n[User - 2025-12-14]: [Media]\n[User - 2025-12-14]: سجلت برقم جوالي الثاني 0583002003\n[Team - 2025-12-14]: تمام، وصلت الملاحظة يا أسامة.\n[Team - 2025-12-14]: ولا يهمك، بيتم اعتماد التسجيل على الرقم اللي ذكرته (0583002003)، وبتوصلك رسالة التأكيد عليه بإذن الله.\n[Team - 2025-12-14]: نعم صحيح\n[User - 2025-12-18]: السلام عليكم\n[User - 2025-12-18]: بس حاب اكد الاسبوع الجاي\n[User - 2025-12-18]: حكون بالدورة باذن الله\n[User - 2025-12-18]: انا جاني رسالة\n[User - 2025-12-18]: و انظميت لقروب بس مدري اذا لهذا الدورة و لا\n[User - 2025-12-18]: اعتقد خرجتوني مهه\n[User - 2025-12-18]: منه\n[User - 2025-12-18]: مو ملاقي\n[Team - 2025-12-18]: وعليكم السلام ورحمة الله وبركاته، حياك الله أخوي أسامة.\n[Team - 2025-12-18]: ممتاز، تم تأكيد حضورك معنا للدورة اللي بتبدأ الأسبوع الجاي (21 ديسمبر) بإذن الله.\n[Team - 2025-12-18]: بخصوص القروب، نعم صحيح هو القروب المخصص للمشتركين، وراح توصلك فيه كل التفاصيل وروابط الدخول والملفات قبل بداية الدورة.\n[Team - 2025-12-18]: أمورك في السليم، وأي استفسار أنا موجود.\n[Team - 2025-12-18]: أفا، ولا يهمك يا أسامة.\n[Team - 2025-12-18]: ببلغ الفريق حالاً يتأكدون من المشكلة ويرجعون يضيفونك فوراً.\n[Team - 2025-12-18]: دقائق وبيتم التواصل معك وحل الموضوع بإذن الله.\n[User - 2025-12-18]: تمام\n[User - 2025-12-18]: للعلم مسجل ع الرقم الثاني 0583002003\n[User - 2025-12-18]: هذي هي المجموعة صحيح !\n[User - 2025-12-21]: يسعد صباحك بكل خير\n[Team - 2025-12-21]: شكرا لتواصلك معنا\nمعاك احمد\n",
+              "messageCount": 66,
+              "lastDirection": "outbound"
+            },
+            {
+              "conversationId": "sABkPKiHquepk3CxU9Wv",
+              "contactId": "yqtZRKOtt2PC7GnnctRC",
+              "history": "[User - 2025-12-21]: السلام عليكم \nاحنا نظام جديد يساعدكم في جمع و فرز عملاء محتملين من زوار موقعكم الإلكتروني، وطريقة اضافة النظام على موقعكم الحالي سهله وبسيطة.\nممكن نتواصل مع الشخص المسؤول عن موقعكم الإلكتروني؟\n",
+              "messageCount": 1,
+              "lastDirection": "inbound"
+            },
+            {
+              "conversationId": "cgGOlH3RNblJE1sGpYas",
+              "contactId": "wxIgc4o5SlJ5T4ckDReT",
+              "history": "[User - 2025-11-24]: السلام عليكم\n[User - 2025-11-24]: الله يعطيكم العافية انا حاب اقدم على دورة الاستثمار الشهري وادارة الثروة ولكن عندي استفسارات\nهل يمكن اتاحة المحاضرات لمدة اكثر من عشر ايام واكثر من محاولة واحدة؟\nلاني جديد على الاستثمار وما اعرف اي شي عنه بالكامل فلذلك ما احس ان الوقت بيكون كافي للتعلم كذا\n[User - 2025-11-24]: ارجو الرذ\n[Team - 2025-11-24]: وعليكم السلام ورحمة الله وبركاته، حياك الله أخوي حاتم.\n[Team - 2025-11-24]: معك سالم من فريق عاصم الرحيلي،\n[Team - 2025-11-24]: تفضل كيف أقدر أخدمك اليوم؟\n[User - 2025-11-24]: د\n[User - 2025-11-24]: الله يعطيكم العافية انا حاب اقدم على دورة الاستثمار الشهري وادارة الثروة ولكن عندي استفسارات\nهل يمكن اتاحة المحاضرات لمدة اكثر من عشر ايام واكثر من محاولة واحدة؟\nلاني جديد على الاستثمار وما اعرف اي شي عنه بالكامل فلذلك ما احس ان الوقت بيكون كافي للتعلم كذا\n[Team - 2025-11-24]: أبشر أخوي حاتم، بخصوص استفسارك. صحيح نقطة مهمة خصوصاً للمبتدئين.\n[Team - 2025-11-24]: حالياً، التسجيلات تكون متاحة للمشاهدة لمدة 14 يوم من بداية الدورة، وهذي المدة تعتبر كافية جداً للمراجعة وتثبيت المعلومات الأساسية اللي تحتاجها كبداية.\n[User - 2025-11-24]: نعم لكن قرأت انها متاحة لمحاولة واحدة فقط\n[User - 2025-11-24]: هل يمكن مشاهدة التسجيلات لعدد لا محدود خلال ال 14 يوم ام انه يجب علي مشاهدتها مرة واحدة فقط؟\n[Team - 2025-11-24]: صحيح، المشاهدة تكون لمرة واحدة لكل مقطع فيديو.\n[Team - 2025-11-24]: والهدف الأساسي هو الحرص على الحضور المباشر والتفاعل مع الأستاذ عاصم لتحقيق أقصى استفادة، وتكون التسجيلات كمرجع إضافي لتثبيت المعلومة.\n[User - 2025-11-24]: طيب هل فيه امكانية مشاهدتها لاكثر من مرة؟\nلان الوقت غير مناسب معاي من ٧ الى ١٠ ولذلك ما راح استطيع الحضور للمحاضرات المباشرة\n[User - 2025-11-24]: والله عندي رغبة كبيرة للتسجيل ف اتمنى انكم تتعاونون معي\n[Team - 2025-11-24]: صحيح، يُسمح بمشاهدة كل مقطع فيديو مرة واحدة. لكن خلال المشاهدة تقدر توقف الفيديو مؤقتاً وترجع تكمل بأي وقت، وهذا يعطيك مرونة كافية للمراجعة وتدوين الملاحظات براحتك خلال فترة الـ 14 يوم.\n[Team - 2025-11-24]: صحيح، وحرصك على الاستفادة الكاملة من الدورة محل تقدير.\n[Team - 2025-11-24]: حالياً، سياسة مشاهدة التسجيلات هي لمرة واحدة فقط لجميع المشتركين، لأن الهدف الأساسي هو تشجيع الحضور المباشر والتفاعل اللي يعتبر أهم جزء في التجربة التعليمية.\n[Team - 2025-11-24]: لكن أبشر، رفعت استفسارك للفريق المسؤول، وفي حال كان فيه أي مرونة أو استثناء راح يبلغونك.\n[User - 2025-11-24]: في حل تم قبول استفساري ارجو التواصل معاي مرة اخرى لاني ارغب بالتسجيل بالدورة\nولكن مبدئيًا ما راح يكون مناسب لي اني ادفع مبلغ وقدره مقابل المشاهدة مرة واحدة\n[Team - 2025-12-19]: مرحبًا 👋🏻\n\nقبل 5 سنوات، طبّق عدد من المتدربين منهجيتنا الاستثمارية بانضباط.\n\nاليوم، نتائجهم تؤكد حقيقة واحدة:\nالاستمرار + خطة واضحة = نمو حقيقي.\n\nبـ 10 دقائق فقط شهريًا، ومن خلال طريقة بسيطة وقابلة للتعلّم،\nتستطيع بناء محفظة استثمارية تحقق نتائج ملموسة بهدوء مع مرور الوقت.\n\nهذه المنهجية ستتعلّمها معنا خلال 5 أيام تدريبية عملية.\n\n📌 دورة الاستثمار الشهري وإدارة الثروة\n💰 السعر: 897 ريال | ⏳ التسجيل متاح ليومين فقط\n\nستتعلم خلال الدورة:\n• بناء محفظة تناسب دخلك\n• حساب العائد والقيمة المستقبلية بوضوح\n• إنشاء خطة استثمار شهرية قابلة للتطبيق فورًا\n\n👤 المحاضر:\nأ. عاصم الرحيلي – مدرب ومدير ثروات معتمد بخبرة تتجاوز 25 سنة\n\n🗓 من الأحد إلى الخميس | 21 – 25 ديسمبر\n⏰ 7:30 – 10:30 مساءً\n🎥 عن بُعد (زوم) – مباشر وتفاعلي\n\nإذا رغبت ببناء محفظتك بخطوات واضحة،\nفهذا هو الوقت المناسب للبدء.\n👉 سجّل الآن https://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\nاكتب \"إالغاء\" أو قف اذا حاب نوقف الرسائل والاشعارات\n[User - 2025-12-20]: السلام عليكم\n[User - 2025-12-20]: الله يعطيكم العافية انا حاب اشترك عندكم بدورة الاستثمار الشهري وادارة الثروة\n[User - 2025-12-20]: بس عندي طلب منكم\nهل فيه امكانية اتاحة مقاطع الدورة لمدة شهر؟\n[User - 2025-12-20]: انا ابغى اشترك وجاهز وودي الان قبل بكرة لكن نقطة صلاحية مشاهدة المقطع مرة واحدة غير مناسبة\nفهل فيه امكانية اتاحة المقاطع لمدة اطول؟\n[Team - 2025-12-20]: عليكم السلام، شكرا لتواصلك معنا\nمعاك احمد\n[Team - 2025-12-20]: [Media]\n[Team - 2025-12-20]: [Media]\n[Team - 2025-12-20]: ⭐️ خصم 55% لفترة محدودة\n\n💰استثمر مدخراتك وابدأ ببناء ثروتك!\n❓ تحس مدخراتك ما تنمو؟\n❓ ودك تستثمر بس ما تعرف من وين تبدأ؟\nدورة مُكثفه و مصممة تساعدك تبدأ تستثمر بطريقة صحيحة و بخطوات سهلة وعملية.\n\nوش راح تتعلم؟\n✅ استثمار مدخراتك شهريًا بطريقة بسيطة ومنظمة\n✅ بناء محفظة استثمارية تدر دخل إضافي مع الوقت\n✅ حماية أموالك من التضخم وتحقيق نمو حقيقي\n✅ وضع خطة استثمارية شخصية تناسب وضعك المالي وأهدافك\nخطتك الشهرية ما راح تاخذ منك أكثر من 10 دقائق شهرياً – ونتائجها تدوم!\n\n🔗 إذا فعلاً تبغى تبدأ، هذه فرصتك.\nسجّل الآن!:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\n📌 تفاصيل الدورة:\n🗓️ من 21 إلى 25 ديسمبر \n(خمسة أيام من 21/12/2025)\n⏰ 7:30م - 10:30م\n💻 أونلاين عبر Zoom\n💰 السعر بعد الخصم: 897 ريال فقط (بدلاً من ~2000 ريال~)\n\n🎁 المميزات للمشتركين:\n• حقيبة تدريبية وادوات مالية حصرية تساعدك على التطبيق والاستمرارية\n• بناء توزيعة وخطة استثمارية قابلة للتطبيق\n• وصول مدى الحياة لتحديثات ادوات الدورة وملفات الحقيبة\n• ⁠*افضل صناديق الاسثمار في السوق*\n[Team - 2025-12-20]: [Media]\n[Team - 2025-12-20]: للتنويه نحن على وشك الاغلاق خلال الساعات القليلة القادمة \n\nاذا كنت تشوف انك تقدر تعطي الدورة حقها من الوقت والتفرغ سواء تحصرها في وقتها او تشاهدها مسجلة او الاثنين معا لك الحرية بإدارة هذا الامر\n\nننصحك تسجل\n\nلكن اذا منت تعرف انك ماراح تقدر تعطي الدورة حقها من الوقت والتفرغ فممكن تؤجل حضورها لمرات قادمة باذن الله\n[User - 2025-12-21]: طيب هل الدورة راح تغنيني عن المستثمرين الاليين؟\nوهل نتائجها افضل منهم؟\nارجوا توضيح هذي النقطة\nايضًا ما فهمت نقطة الادوات اللي راح يتم توفيرها للاستثمار\nاتمنى شرح هذي النقطة ايضًا\n[User - 2025-12-21]: انا ارغب بالتسجيل لكن بالدورة القادمة باذن الله وليست هذي الدورة \nولكن ارغب بالتأكد قبل التسجيل ايضًا\n",
+              "messageCount": 34,
+              "lastDirection": "inbound"
+            },
+            {
+              "conversationId": "p03dej4ZPxvt5mjI0wAq",
+              "contactId": "V5hhDzLJ6jyWb8Ro6Edk",
+              "history": "[User - 2025-12-19]: السلام عليكم ورحمه الله\n[Team - 2025-12-19]: وعليكم السلام ورحمة الله وبركاته، حياك الله. تفضل، كيف أقدر أخدمك؟\n[User - 2025-12-19]: [Media]\n[User - 2025-12-19]: بالنسبة لدورة الي بتاريخ ٢١ ديسمبر هل يمكن مشاهدة الدورة مسجلة في اي وقت\n[Team - 2025-12-20]: دورة الاستثمار  عن بعد بث مباشر عبر برنامج `زوم`\n\nو يتم اتاحة فيديو تسجيلات الدورة للمتدربين لمن يرغب المشاهدة المسجلة بوقت آخر او للمراجعة\n\nصلاحية التسجيلات تستمر 14 يوم من تاريخ الدورة\n[Team - 2025-12-20]: ⭐️ خصم 55% لفترة محدودة\n\n💰استثمر مدخراتك وابدأ ببناء ثروتك!\n❓ تحس مدخراتك ما تنمو؟\n❓ ودك تستثمر بس ما تعرف من وين تبدأ؟\nدورة مُكثفه و مصممة تساعدك تبدأ تستثمر بطريقة صحيحة و بخطوات سهلة وعملية.\n\nوش راح تتعلم؟\n✅ استثمار مدخراتك شهريًا بطريقة بسيطة ومنظمة\n✅ بناء محفظة استثمارية تدر دخل إضافي مع الوقت\n✅ حماية أموالك من التضخم وتحقيق نمو حقيقي\n✅ وضع خطة استثمارية شخصية تناسب وضعك المالي وأهدافك\nخطتك الشهرية ما راح تاخذ منك أكثر من 10 دقائق شهرياً – ونتائجها تدوم!\n\n🔗 إذا فعلاً تبغى تبدأ، هذه فرصتك.\nسجّل الآن!:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\n📌 تفاصيل الدورة:\n🗓️ من 21 إلى 25 ديسمبر \n(خمسة أيام من 21/12/2025)\n⏰ 7:30م - 10:30م\n💻 أونلاين عبر Zoom\n💰 السعر بعد الخصم: 897 ريال فقط (بدلاً من ~2000 ريال~)\n\n🎁 المميزات للمشتركين:\n• حقيبة تدريبية وادوات مالية حصرية تساعدك على التطبيق والاستمرارية\n• بناء توزيعة وخطة استثمارية قابلة للتطبيق\n• وصول مدى الحياة لتحديثات ادوات الدورة وملفات الحقيبة\n• ⁠*افضل صناديق الاسثمار في السوق*\n[Team - 2025-12-20]: كما نود التنويه اننا ستنغلق اجراءات التسجيل بنهاية اليوم\n[User - 2025-12-20]: Message type is currently not supported.\n[User - 2025-12-20]: [Media]\n[User - 2025-12-20]: [Media]\n[User - 2025-12-20]: تم الدفع\nخالد مجاهد الظفيري\n[Team - 2025-12-20]: تم تأكيد تسجيلك في دورة الاستثمار الشهري وإدارة الثروة\nشكرًا لانضمامك معنا!  🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان:\nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ المتطلبات:\nتأكد من تثبيت البرنامجين التاليين على جهازك:\n🔹 Zoom\n🔹 Excel\n✅ الموعد:\n🗓️ الأحد إلى الخميس (21 إلى 25 ديسمبر 2025)\n⏰ 7:30م - 10:30م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/1RFoU3vxTqDmOU9k_Xf1Oc8G1yzICsl8H?usp=drive_link\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/Yy0R16xegmsMlRvTiPRF\n*يُغلق قبل بدء الدورة*\n\nنلقاكم قريبًا وبالتوفيق! 🌟\n[Team - 2025-12-20]: ⚠️ لتحقيق أقصى استفادة من الدورة:\n\n1️⃣ نوصيك بقراءة تعليمات الدورة بعناية.\n\n2️⃣ حمّل ملفات الدورة على جهازك مباشرة، واستخدم الملفات من جهازك بدلًا من فتحها من قوقل درايف.\n\n3️⃣ تفقّد جميع أقسام بريدك الإلكتروني (بما فيها البريد المهمل/Spam)، فقد تصلك رسائل مهمة هناك.\n[Team - 2025-12-20]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[User - 2025-12-21]: تم الانضمام لقروب الواتساب برقم ‏‪+966 58 173 0107‬‏\nارجو عدم إضافة رقمي الشخصي لقروب الواتساب 0541234474\n[Team - 2025-12-21]: حياك الله اخي خالد \nلايمكننا اضافه رقم غير مسجل ضمن سجلات الدورة للقروب \n\nلذا سيتم استبدال رقمك من الرقم الي اراسلك عليه الان للرقم الاخر\n[Team - 2025-12-21]: الرجاء قبول دعوة الانضمام لقروب الواتساب في اقرب وقت\n",
+              "messageCount": 17,
+              "lastDirection": "outbound"
+            },
+            {
+              "conversationId": "zvKQW45KNrH7fYMTrUeT",
+              "contactId": "mMOGX3tuhrqWt7zKNyV7",
+              "history": "[Team - 2025-10-24]: *هل خطتك الاستثمارية مُحدّثة؟*\n\nمرحباً عبدالله،\n\nلأنك شريك أساسي معنا (من المشاركين السابقين في دورة \"الاستثمار الشهري\")، نقدّم لك هذه الدعوة الحصرية للاحتفال معنا *بالدورة رقم 100!* 🥳\n\nمنذ أنهيت الدورة معنا، قد يراودك شعور بـ:\n• الحاجة للتأكد أن محفظتك ما زالت على المسار الصحيح.\n• الرغبة في معرفة *أحدث* الصناديق الاستثمارية المتاحة.\n• وجود أسئلة جديدة ظهرت مع التطبيق وتحتاج لإجابات مباشرة.\n\nلهذا السبب، صممنا لك ورشة عمل مركزة كـ *تكريم لك* ، ولتكون جواباً لهذه التساؤلات.\n\n*في 4 ساعات فقط، ستحصل على:*\n✅ *تحديث* لأهم الصناديق الاستثمارية المميزة.\n✅ *مراجعة* جوهرية لأساسيات بناء المحفظة.\n✅ *استشارات مباشرة* مع أ. عاصم الرحيلي لطرح أسئلتك.\n✅ *نماذج وخطط* استثمارية واقعية وجديدة.\n\n---\n*تفاصيل الحدث الحصري:*\n📅 *الموعد:* 1/11/2025\n⌛️ *الوقت:* من 6:00م إلى 10:00م\n💰 *رسوم رمزية (خاصة بك):* 100 ريال فقط (قبل الضريبة).\n\n🟢 *المقاعد محدودة جداً والتسجيل حصري للمشاركين السابقين فقط.*\n\nلا تفوّت فرصة شحذ مهاراتك وتحديث خطتك.\n[Team - 2025-10-24]: *هل خطتك الاستثمارية مُحدّثة؟*\n\nمرحباً عبدالله،\n\nلأنك شريك أساسي معنا (من المشاركين السابقين في دورة \"الاستثمار الشهري\")، نقدّم لك هذه الدعوة الحصرية للاحتفال معنا *بالدورة رقم 100!* 🥳\n\nمنذ أنهيت الدورة معنا، قد يراودك شعور بـ:\n• الحاجة للتأكد أن محفظتك ما زالت على المسار الصحيح.\n• الرغبة في معرفة *أحدث* الصناديق الاستثمارية المتاحة.\n• وجود أسئلة جديدة ظهرت مع التطبيق وتحتاج لإجابات مباشرة.\n\nلهذا السبب، صممنا لك ورشة عمل مركزة كـ *تكريم لك* ، ولتكون جواباً لهذه التساؤلات.\n\n*في 4 ساعات فقط، ستحصل على:*\n✅ *تحديث* لأهم الصناديق الاستثمارية المميزة.\n✅ *مراجعة* جوهرية لأساسيات بناء المحفظة.\n✅ *استشارات مباشرة* مع أ. عاصم الرحيلي لطرح أسئلتك.\n✅ *نماذج وخطط* استثمارية واقعية وجديدة.\n\n---\n*تفاصيل الحدث الحصري:*\n📅 *الموعد:* 1/11/2025\n⌛️ *الوقت:* من 6:00م إلى 10:00م\n💰 *رسوم رمزية (خاصة بك):* 100 ريال فقط (قبل الضريبة).\n\n🟢 *المقاعد محدودة جداً والتسجيل حصري للمشاركين السابقين فقط.*\n\nلا تفوّت فرصة شحذ مهاراتك وتحديث خطتك.\n[Team - 2025-10-24]: Unsupported message received\n[User - 2025-12-21]: السلام عليكم ورحمة الله وبركاته \nأهلاً استاذ أحمد\nمعك عبدالله المسعودي صاحب موقع \nbestgsheetstemplates.com\n\n\nنقدم في موقعنا قالب مجاني يفيد المستثمرين في السوق الأمريكي \nملف جوجل شيت يحلل اي سهم شركة بضغطة زر مجانا\nhttps://bestgsheetstemplates.com/b/XAgvD\n\nباذن الله يكون مفيد لمتابعيكم، وسنكون ممتنين لنشره لديكم ونحب نسمع منكم استاذي لو لديكم آلية اخرى للنشر والتعاون\n\nكذلك لدينا العديد من المنتجات  المتقدمة (المدفوعة) الاخرى ، بامكانكم الاطلاع عليها في الموقع\n",
+              "messageCount": 4,
+              "lastDirection": "inbound"
+            },
+            {
+              "conversationId": "CbxC3OwZdtVkS145LPOn",
+              "contactId": "gtiUN7IRgtwZSA98DvZL",
+              "history": "[Team - 2025-12-07]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[User - 2025-12-07]: السلام عليكم دورة الدليل العملي لإدارة دخلك ومصاريفك بتكون عن بعد صح عن طريق الزوم ولا ايش؟\n[Team - 2025-12-07]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[Team - 2025-12-07]: وعليكم السلام، حياك الله أخت عبير. صحيح، الدورة تكون عن بعد ومباشرة عبر برنامج زوم (Zoom).\n[Team - 2025-12-07]: وعليكم السلام، حياك الله أخت عبير. صحيح، الدورة تكون عن بعد ومباشرة عبر برنامج زوم (Zoom).\n[User - 2025-12-07]: تم الاشتراك والدفع 👍🏻✅\n[Team - 2025-12-07]: الله يبارك لك. بيتم تأكيد تسجيلك وبتوصلك رسالة التأكيد قريباً بإذن الله.\n[Team - 2025-12-07]: الله يبارك لك. بيتم تأكيد تسجيلك وبتوصلك رسالة التأكيد قريباً بإذن الله.\n[Team - 2025-12-07]: تم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة\nشكرًا لانضمامك معنا!\nتم تأكيد تسجيلك في دورة الإدارة المالية الشخصية ببساطة 🎉\n\n🔴 معلومات هامة عن الدورة:\n\n✅ المكان: \nعبر برنامج Zoom (سيتم مشاركة الرابط ورمز الدخول لاحقًا).\n✅ الموعد:\n🗓️ الاحد والاثنين، 14 - 15 ديسمبر\n⏰ 7:30م إلى 10:30م (بتوقيت السعودية).\n\n📢 قبل بدء الدورة:\n🔹 سيتم إضافتك إلى مجموعة واتس آب مغلقة يوم الدورة لمشاركة الروابط والتعليمات.\n🔹 تأكد من تطابق اسمك في برنامج Zoom مع اسمك المسجل في استمارة الدورة.\n🔹 يُفضل استخدام جهاز لابتوب للحصول على تجربة أفضل.\n\n📌 ملفات الدورة:\nحمل ملفات حقيبة الدورة الآن من الرابط أدناه، نقترح طباعة (كُتيّب المتدرب) أو تجهيز ورقة وقلم للملاحظات:\n🔗 https://drive.google.com/drive/folders/10t9FgCiDFVw8X_KbpjgVoQAL6XD62o1X\n\n🏅 لطلب شهادة الحضور (اختياري):\nيرجى تعبئة النموذج الان\n🔗https://zfrmz.com/stG5REcajkPAGgvtydTx\n*يُغلق قبل بدء الدورة*\n\nنتطلع لرؤيتك في الدورة! 🌟\n[Team - 2025-12-07]: Unsupported message received\n[User - 2025-12-15]: معليش سؤال نص الدوره امس ماحضرتها كان النت يقطع عندي والصراحه ابي اعيدها بس مافهمت الحين اسوي طلب من الرابط وترسلونه لي الفيديو ولا ايش ؟\n[Team - 2025-12-15]: حياك الله أخت عبير. صحيح، الطريقة هي تعبئة نموذج طلب التسجيل (الرابط موجود في مجموعة الواتساب الخاصة بالدورة). بعد ما تعبين البيانات بنفس إيميلك المسجل، بيوصلك رابط المشاهدة.\n[User - 2025-12-15]: من سجلت معكم ماجاني على الايميل ف اخاف مايجيني\n[Team - 2025-12-15]: شيكي على قسم البريد المهمل او spam غالبا يوصلك الايميل هناك\n\nلين انتي تختارين بالايميل اننا جهه غير مزعجة او تختاري موثوقيه مصدر الايميل بعدها ايميلاتنا توصلك على صندوق الوارد\n[Team - 2025-12-15]: المقصد شيكي كل أقسام ايميلك\n[Team - 2025-12-15]: هذا ايميلك المسجل عندنا\naber_h22@hotmail.com\n\nاذا كان خطأ زوديني بالايميل الصحيح\n[Team - 2025-12-15]: وايضا تأكدي ان ايميلك مساحته ماهي ممتلئه\n[User - 2025-12-15]: لقيتها ب البريد المهمل 👍🏻\n[Team - 2025-12-21]: تم تسجيل طلبك بدورة\nالاستثمار الشهري وإدارة الثروة📍 \n\nلإكمال تسجيلك قبل إغلاق التسجيل:\nحوّل رسوم الدورة المخفضة (897 ريال) على الحساب أدناه،\nوأرسل صورة الحوالة مع اسم المحول إلى واتساب: 0506445151\n\n• بنك الراجحي\n• رقم الحساب: 602608010781427\n• الآيبان: SA0780000602608010781427\n• اسم الحساب: مكتب عاصم الرحيلي للاستشارات المالية\n\n🔴 سارع بالسداد لإتمام انضمامك!\n[Team - 2025-12-21]: تم تسجيل طلبك بدورة\nالاستثمار الشهري وإدارة الثروة📍 \n\nلإكمال تسجيلك قبل إغلاق التسجيل:\nحوّل رسوم الدورة المخفضة (897 ريال) على الحساب أدناه،\nوأرسل صورة الحوالة مع اسم المحول إلى واتساب: 0506445151\n\n• بنك الراجحي\n• رقم الحساب: 602608010781427\n• الآيبان: SA0780000602608010781427\n• اسم الحساب: مكتب عاصم الرحيلي للاستشارات المالية\n\n🔴 سارع بالسداد لإتمام انضمامك!\n",
+              "messageCount": 20,
+              "lastDirection": "outbound"
+            },
+            {
+              "conversationId": "O811Nr6XtcTPdRMH5BCX",
+              "contactId": "7OXn0uEQ3ToHr4ACtjWC",
+              "history": "[Team - 2025-09-06]: *كيف تبني محفظة استثمارية تنمو بثبات؟*\n\nبعد سنوات من العمل في قلب جهات مالية كبيرة مثل HSBC, دراية المالية و بنك البلاد لاحظ *عاصم الرحيلي* أن المبادئ الصحيحة للاستثمار تبدو معقدة أو بعيدة عن متناول الفرد العادي.\n\nلذلك، صمم هذه الدورة ليقدم لك خلاصة خبرته الممتدة لـ25 سنة في مجال الإستثمار، بخطوات عملية وواضحة، تمكّنك من إدارة أموالك بنفسك وبثقة.\n\n*هذه الدورة مصممة لك إذا كنت:*\n- موظفاً وتريد أن تعمل أموالك من أجلك.  \n- تبحث عن طريقة منظمة لحماية مدخراتك من التضخم.  \n- تشعر بالتردد من كثرة الخيارات الاستثمارية وتحتاج لخارطة طريق.  \n\n*الهدف من الدورة هو تزويدك بـ:*\n1. *خطة شخصية:* ستخرج بخطة استثمار واضحة تناسب دخلك وأهدافك.  \n2. *ثقة أكبر:* ستتعلم الأسس التي تمكنك من اتخاذ قراراتك المالية باستقلالية.  \n3. *نمو مستمر:* ستعرف كيف تبني أصولاً متنوعة تساهم في تحقيق أمانك المالي.  \n\n*لجعل المعرفة المالية في متناول الجميع، نقدم خصماً خاصاً بنسبة 55% للتسجيل المبكر.*  \nالسعر: *897 ريال فقط* (بدلاً من 2000).\n\n🗓️ 7 - 11 سبتمبر | ⏰ 7:00م - 10:00م | أونلاين (Zoom)\n\nاكتب الغاء اذا حاب نوقف الرسائل\n[Team - 2025-09-26]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[Team - 2025-09-26]: شكراً لك على تواصلك مع شركة عاصم الرحيلي للاستشارات المالية. من فضلك أخبرنا كيف يمكننا خدمتك.\n\n> أيام العمل\nالاحد الى الخميس الساعة 10صباحاً الى 7:00م\n[User - 2025-09-26]: وفي ليله الجمعه لنا دعوه وأمل  بقلبي بأن ييسر الله امورنا ويجعلنا سعه في رزقنا وان يفتح علينا وعليكم الخير\nارفع كفي برجائي  لرب العالمين قاضي الحاجات في هذه الساعه من الثلث الأخير باليل التي ينزل فيها إلى السماء الدنيا وينادي من يدعوني فأستجب له من يسألني فأعطيه من يستغفرني فأغفر له هل من تائب فاتوب عليه \n فأنا ادعيه بأن يفرج همنا وكربتنا وييسر امرنا ويصلح حالنا يحببنا الي طاعته  ويحقق احلمنا ويسهل أمرنا ويوفقنا لما يحب ويرضى نحن وإياك وجميع المسلمين\n[Team - 2025-09-28]: 📢 عرض اليوم الوطني 2025 🇸🇦\n\nتخيل إنك تقدر:\n✅ ترتب دخلك ومصاريفك وتبني فائض مالي بسهولة.\n✅ تبدأ تستثمر صح وتبني محفظة ثروة تدوم معك طول العمر.\n\nهذا بالضبط اللي بتحصله في دورتين مكثفة مع المستشار المالي عاصم الرحيلي:\n\n1️⃣ الإدارة المالية الشخصية\n(29 – 30 سبتمبر) – يومين عمليين تصنع فيهم أول خطوة حقيقية للحرية المالية.\n\n2️⃣ الاستثمار الشهري وإدارة الثروة\n(5 – 9 أكتوبر) – 5 أيام تدريبية تتعلم فيها بناء محفظة استثمارية تغطي الأسهم، العقار، السلع، الصكوك وغيرها.\n\n🎁 سعر العرض المميز لليوم الوطني:\n895 ريال فقط (بدل ~2,450 ريال~) – يعني وفرت 1,555 ريال 🔥\n\n📌 العرض لمرة واحدة – المقاعد محدودة\n\nسجّل الآن قبل ما يفوتك:\n👉 https://forms.alruhaily.com/alruhaily/form/95/formperma/xcZ-_fd7GA-Ww6dTFVmQBNqwzMqgIbNUHyrvfDKHxTc?referrername=AH\n[User - 2025-10-10]: اللهم إني أسألك في هاذه الساعه  بليله الجمعه من الخير كله عاجله وآجله ما علمت منه وما لم أعلم  وأعوذ بك من الشر كله ما علمت منه وما لم أعلم  اللهم إني أسألك من خير ما سألك عبدك ونبيك  وأعوذ بك من شر ما عاذ به عبدك ونبيك  اللهم إني أسألك الجنة وما قرب إليها من قول أو عمل وأعوذ بك من النار نحن وإياكم وجميع المسلمين اللهم امين يارب العالمين\n[User - 2025-10-17]: اسال الله العظيم بثلث الاخير من ليله الجمعة ان يكتب اجر اولئك الأخوه الطيبين الذين تشربت أرواحهم من منابع الصفاء والجمال فانعكست على وجوههم ملامح الطيبة والنقاء اسال الله ان يخلف على أولئك اللذينا جادو علينا خيرا وان يزيدهم توفيقًا ورفعة الكرماء الذين لم يرضون على أنفسهم بغير الجود والعطاء فازدادوا بذلك ر فعة وارتقاء اللهم وفق أولئك النبلاء الذين وجدنا في نفوسهم لذه بامتثال الفضائل الذين يرون الحياه بسيطه ويبتغون رضاء الله وجعلونا نشعر بحلاوه الحياه رغم صعوبتها\n[User - 2025-10-24]: اللهم يامسبب الأسباب ويافاتح الأبواب ياسامع الأصوات يامجيب الدعوات اللهم اني اسألك بثلث  الأخير من ليلة الجمعة اللهم ياقاضي الحاجات اقضي حوائجنا واغننا بفضلك عمن سواك اللهم اني أسألك ان تحفظ علينا النعم وتدفع عنا النقم وان ترزقنا حلو الحياة وخير العطاء وسعة الرزق وراحه البال ولباس العافية وحسن الخاتمة اللهم آمين يارب العالمين\n[Team - 2025-12-08]: 🌟خطوتك الأولى نحو الحرية المالية تبدأ من هنا\n\n❓ تواجه صعوبة في تنظيم دخلك؟\n❓ تحاول تدخر لكن المصاريف تسبقك؟\nهالدورة راح تغيّر طريقتك في التعامل مع المال بالكامل!\n\nوش راح تتعلم؟\n✅ بناء خطة مالية شخصية تناسب حياتك\n✅ إدارة المصاريف والتحكم بعاداتك المالية\n✅ التخلص من الديون وتجنّب الأزمات\n✅ صناعة فائض مالي يسهل ادخاره\n\n`كل هذا بأسلوب بسيط وعملي يناسب الجميع!`\n\n🔗 رابط التسجيل:\nhttps://forms.alruhaily.com/alruhaily/form/Untitled12/formperma/_qW7nmeZCRHpKJgcx6R2tM3HgB57dWiLjMnfs9j1JFw?referrername=AH‬⁩\n\n📌 تفاصيل الدورة:\n🗓️ التاريخ: 14 & 15 ديسمبر\n⏰ الوقت: من 7:30م إلى 10:30م\n💻 عن بُعد (أونلاين عبر Zoom)\n\n💵 السعر بعد الخصم: 225 ريال فقط (بدلاً من ~450~)\n⚡ الخصم لفترة محدودة!\n\n🎁 المشتركين يحصلون على:\n• محتوى حصري و ملفات تدريبية وأدوات مالية مساعدة.\n• تطبيق عملي لطريقة الإدارة المالية الصفرية.\n\n📎 اضغط على رابط التسجيل لمزيد من التفاصيل\n\nللإيقاف استقبال الرسائل التسويقية ارسل كلمة \"إلغاء\" او \"قف\"\n[User - 2025-12-11]: اسأل الله الكريم في ليلة الجمعة ان يجعل ملائكتة الكرام تكتبك من اللذينا سار بين الناس جابرًا للخواطر فأدركتهم رحمه الله في جوف المخاطر ويجبر الخواطرمحبو الخير لغيرهم الطيبون أصحاب الأثر الطيب أولئك هم الجبارين الذين استلهموا اللطف من اسم الله الجبار من يجبُر ضعف القلوب وفاقتها من يجبر الفقر بالغنى والعلة بالصحة والخيبة بالأمل لجبره تعبد رسول الله بين كل سجدتين فقال اللهم اغفر لي وارحمني واجبرني واهدني،، وجبر الخواطر خلق عظيم يدل على سمو النفس وعظمة القلب وسلامة الصدر ورجاحة العقل تجبر فيه نفوس كسرت وقلوب فطرت وأجسام أرهقت،،\nاللهم اجبر قلوب عبادك اللذينا كانو ومازلو جابرين لخواطرنا اللهم جازهم عنا خير الجزاء وافتح لهم ابواب الرحمه والمغفره..\n[User - 2025-12-12]: [Media]\n[User - 2025-12-19]: اللهم في يوم الجمعه اغفر لنا ولوالدينا والمسلمين اجمعين اللهم ان في حياتنا اخوه جمعتنا بهم المواقف وكانو لنا سندآ في كل شي وكانو رفقاء بنا فاارفق بهم ياالله وكانو ومازلو بنا رحما فرحمهم برحمتك ومنك وجودك وكرمك اللهم حقق امنياتهم واصلح حالهم واعطهم اضعاف مايتمنوه اللهم احسن إليهم كما أحسنو الينا ورزقهم جنات النعيم بلى حساب أو سابق عذاب اللهم جد عليهم انك انت الجواد الرحيم اللهم استر من سترنا في الدنياوالاخره اللهم انت رب الطيبين وفي حياتنا اناسآ طيبين فحفظهم بحفظك * جمعتك مباركه اخي  قال رسول الله صلى الله عليه وسلم انتم شهداء الله في الأرض،، وانا شاهده امام الله يوم نقف بين يده بأنك كنت لنا اخ وسند وكنت من عباده الرحماء فجزاك الله عنا كل خير،،،\n[Team - 2025-12-19]: مرحبًا 👋🏻\n\nقبل 5 سنوات، طبّق عدد من المتدربين منهجيتنا الاستثمارية بانضباط.\n\nاليوم، نتائجهم تؤكد حقيقة واحدة:\nالاستمرار + خطة واضحة = نمو حقيقي.\n\nبـ 10 دقائق فقط شهريًا، ومن خلال طريقة بسيطة وقابلة للتعلّم،\nتستطيع بناء محفظة استثمارية تحقق نتائج ملموسة بهدوء مع مرور الوقت.\n\nهذه المنهجية ستتعلّمها معنا خلال 5 أيام تدريبية عملية.\n\n📌 دورة الاستثمار الشهري وإدارة الثروة\n💰 السعر: 897 ريال | ⏳ التسجيل متاح ليومين فقط\n\nستتعلم خلال الدورة:\n• بناء محفظة تناسب دخلك\n• حساب العائد والقيمة المستقبلية بوضوح\n• إنشاء خطة استثمار شهرية قابلة للتطبيق فورًا\n\n👤 المحاضر:\nأ. عاصم الرحيلي – مدرب ومدير ثروات معتمد بخبرة تتجاوز 25 سنة\n\n🗓 من الأحد إلى الخميس | 21 – 25 ديسمبر\n⏰ 7:30 – 10:30 مساءً\n🎥 عن بُعد (زوم) – مباشر وتفاعلي\n\nإذا رغبت ببناء محفظتك بخطوات واضحة،\nفهذا هو الوقت المناسب للبدء.\n👉 سجّل الآن https://forms.alruhaily.com/alruhaily/form/Untitled15/formperma/PKhhHUWXEn8nbMgOOPTfo-1FCRupYDEtpiuCUf_BpUs?referrername=AH\n\nاكتب \"إالغاء\" أو قف اذا حاب نوقف الرسائل والاشعارات\n[User - 2025-12-21]: اللهم افتح لنا في شهر رجب..\nفتحآ يمحو التعب ويرفع البلاء ويجلب معه رزقآ يدهش قلوبنا وخيرآ لم نتوقعه ونورآ يسبق خطواتنا اللهم اجعل هذا الشهر نقطه تحول من ضيق إلى سعة ومن ضعف الي قوة ومن انتظار إلى تحقيق فأنت القادر على كل شيء\n",
+              "messageCount": 14,
+              "lastDirection": "inbound"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Daily Schedule": {
+      "main": [
+        [
+          {
+            "node": "GHL: Get Conversations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Get Conversations": {
+      "main": [
+        [
+          {
+            "node": "GHL: Get Each Conversation + Process",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Get Each Conversation + Process": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Execute Workflow: 100 Convo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Execute Workflow: 200 Convo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow: 100 Convo": {
+      "main": [
+        [
+          {
+            "node": "Interests Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow: 200 Convo": {
+      "main": [
+        [
+          {
+            "node": "Aggregate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate": {
+      "main": [
+        [
+          {
+            "node": "Interests Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interests Actions": {
+      "main": [
+        [
+          {
+            "node": "Tags Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tags Actions": {
+      "main": [
+        [
+          {
+            "node": "Labels Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Contact": {
+      "main": [
+        [
+          {
+            "node": "Get Courses Instances (Inv)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Courses Instances (Inv)": {
+      "main": [
+        [
+          {
+            "node": "Combine Courses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find - Contact": {
+      "main": [
+        [
+          {
+            "node": "Get Courses Instances (Fin)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Courses Instances (Fin)": {
+      "main": [
+        [
+          {
+            "node": "Combine Courses (Fin)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Courses": {
+      "main": [
+        [
+          {
+            "node": "Enroll Contact (Fin)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Courses (Fin)": {
+      "main": [
+        [
+          {
+            "node": "Enroll Contact (Inv)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Courses : Payment Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Switch1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch1": {
+      "main": [
+        [
+          {
+            "node": "Find Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find - Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Google: Gemini 3 Flash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Airtable: Store ConversationH & AI Results": {
+      "main": [
+        [
+          {
+            "node": "Replace me with your logic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google: Gemini 3 Flash": {
+      "main": [
+        [
+          {
+            "node": "Airtable: Store ConversationH & AI Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5 Minutes Waiting": {
+      "main": [
+        [
+          {
+            "node": "Xai: Grok 4 (Batch 2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Xai: Grok 4 (Batch 1)": {
+      "main": [
+        [
+          {
+            "node": "5 Minutes Waiting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Xai: Grok 4 (Batch 2)": {
+      "main": [
+        [
+          {
+            "node": "Replace me with your logic1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Xai: Grok 4 (Batch 1)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "33adb5eb-c014-4648-9a34-835a8fe9739d",
+  "meta": {
+    "instanceId": "0e373d28b8f076437fee56ac6c52683027f1985f1cdb753702b12ec417ef6477"
+  },
+  "id": "PNEAyiAhUN9fSKSY",
+  "tags": []
+}
